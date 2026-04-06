@@ -41,7 +41,7 @@ int __fastcall main(int argc, const char **argv, const char **envp)
 
 翻看程序汇编指令，会有这样一段非常奇怪的汇编指令
 
-!![](images/recho3.png)
+!![](images/recho4.png)
 
 强转为汇编指令就会发现这个正是我们想要的add，将rdi储存地址里的数据加上al。这里给不知道al的同僚补充一下，al是rax的低八字节，ah是高八字节。
 
