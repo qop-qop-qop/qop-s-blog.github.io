@@ -48,7 +48,7 @@ __int64 __fastcall main(__int64 a1, char **a2, char **a3)
 
 checksec一下
 
-![](.\images\GUESS.png)
+![](./images/GUESS2.png)
 
 程序只开了canary跟NX，并且程序里有一个很明显的gets函数的栈溢出。
 
