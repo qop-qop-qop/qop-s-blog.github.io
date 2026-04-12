@@ -1,42 +1,42 @@
 第一次接触高版本的libc，但是这题并没有涉及到高版本的漏洞，而是逻辑漏洞。
 
-<img src="images\dark1.png" style="zoom: 50%;" />
+<img src="images/dark1.png" style="zoom: 50%;" />
 
 主程序里面就是一个普普通通的菜单函数。
 
-<img src="images\dark2.png" alt="image-20260412180500087" style="zoom:50%;" />
+<img src="images/dark2.png" alt="image-20260412180500087" style="zoom:50%;" />
 
 create函数会创建两个堆，一个是固定的头堆，用来储存数据堆的地址还有一系列基本信息。这里头堆开始的地方被放入了一个.bss段的地址。这个比较重要后面会有用。头堆下的数据堆就很正常，只不过是堆的地址被放在了头堆。
 
 然后我们来看一下delete函数。
 
-<img src="images\dark3.png" alt="image-20260412180930784" style="zoom:50%;" />
+<img src="images/dark3.png" alt="image-20260412180930784" style="zoom:50%;" />
 
 这里很明显能看到两个堆再被free之后指针并没有被删除，存在uaf漏洞。
 
-<img src="images\dark、4.png" alt="image-20260412181033294" style="zoom:50%;" />
+<img src="images/dark、4.png" alt="image-20260412181033294" style="zoom:50%;" />
 
 edit函数检查了输入的size大小，堆没有溢出。并且头堆也没有修改的权限。
 
 然后就是比较重要的两个函数，note跟active函数了。
 
-<img src="images\dark5.png" alt="image-20260412181347228" style="zoom:50%;" />
+<img src="images/dark5.png" alt="image-20260412181347228" style="zoom:50%;" />
 
 这个函数很简单就是创造一个完全由我们控制的任意大小的堆，但是只能在创造时写入一次。
 
-<img src="images\dark6.png" alt="image-20260412181515042" style="zoom:50%;" />
+<img src="images/dark6.png" alt="image-20260412181515042" style="zoom:50%;" />
 
 这个函数就比较迷惑人了。if后面那一串翻译过来就是调用头堆里面储存的.bss段里面储存的地址指向的函数，并且传入头堆所指向的数据堆。
 
 但是这个.bss段储存的是什么呢。咱们去ida里面看一下。
 
-<img src="images\dark7.png" alt="image-20260412181844538" style="zoom:50%;" />
+<img src="images/dark7.png" alt="image-20260412181844538" style="zoom:50%;" />
 
 里面很明显是调用了两个地址。分别是destruct跟process。
 
-<img src="images\dark9.png" alt="image-20260412181957873" style="zoom:50%;" />
+![](./images/dark9.png)
 
-<img src="images\dark8.png" alt="image-20260412182009149" style="zoom:50%;" />
+<img src="images/dark8.png" alt="image-20260412182009149" style="zoom:50%;" />
 
 这两个函数可看出是去打印数据段的函数，并且active函数在调取这两个函数之前并没有对是否被free检查。delete函数num在堆被free之后也没有进行变化。process函数打印数据也没有进行检查是否是数据堆。
 

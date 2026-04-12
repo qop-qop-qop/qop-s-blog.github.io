@@ -1,4 +1,4 @@
-![](image\start0.png)
+![](image/start0.png)
 
 ida打开第一眼我是懵的，以为是程序出错了。
 

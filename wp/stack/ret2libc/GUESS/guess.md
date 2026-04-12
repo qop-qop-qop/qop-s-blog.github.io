@@ -76,11 +76,11 @@ __int64 sub_400A11()
 
 后面就是动态调试去确定偏移了。
 
-![](images\GUESS1.png)
+![](./images/GUESS1.png)
 
 在调取gets之后设置断点，可以看到，我们输入的aaaaaaaa是被存入了0x7fffffffdc70，而文件名的调取链则有0x7fffffffdd98，偏移为0x128。
 
-![](images\GUESS2.png)
+![](./images/GUESS2.png)
 
 通过这些命令就能找到environ里面所储存的栈地址。与flag的偏移为0x168。
 

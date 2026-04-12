@@ -27,7 +27,7 @@ int __fastcall main(int argc, const char **argv, const char **envp)
 
 但是程序没给后门函数没法直接跳转。然后就需要用到libc。but要用libc就需要泄露libc地址。
 
-![](images\recho1.png)
+![](images/recho1.png)
 
 程序就开了一个NX防护。此时有一个问题，read会一直保持真，函数不会停止。既然不会停止就不会触发返回地址进行跳转。本地可以用ctrl+D但是远程呢。只能用pwntools的函数shutdown。但是如果要进行泄露就需要先触发跳转，触发跳转就要结束程序，之后的利用泄露进行攻击就无法进行。所以只能一次发送攻击脚本。
 
