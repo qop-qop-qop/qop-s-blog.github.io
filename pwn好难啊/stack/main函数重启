@@ -1,0 +1,4 @@
+mov rax, [rsp+num+var_B0]
+call rax
+这个代码片段广泛用于程序输入点不足，可利用main函数返回的call_start函数进行更改偏移跳转到这个指令的位置从而使rax寄存器里的值自动计算为main函数的地址实现main函数重启。
+广泛用于开启了pie但是main函数需要再次利用的情况。
