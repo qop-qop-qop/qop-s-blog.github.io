@@ -9,7 +9,7 @@
 暴力枚举
 
 - Stack Reading
-货期栈上数据来泄露canaries,以及ebp返回地址
+获取栈上数据来泄露canaries,以及ebp返回地址
 
 - Blind ROP
 找到足够多的gadget来控制输出函数的参数,并且对其调用,比如说常见的write函数以及puts函数
