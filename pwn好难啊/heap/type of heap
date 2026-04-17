@@ -1,0 +1,11 @@
+## fast bins
+
+以单链表的形式连接，对于double free有简单的检查，仅仅检查当前取出的堆块与下一个堆块是否相同。在large bin触发malloc_conoliadte时会被整合合并相邻的堆块放入unsorted bin中。在glibc2.30+加入了key防护机制。
+
+## tcache
+
+与fastbin类似以单链连接，但是只能储存7个堆块且多线程之间不互通。2.26版本几乎没有防护检查。2.27版本引入key防止double free。
+2.31版本分配时强制检查count>0。2.32版本引入指针异或加密。
+2.34版本key变为数。
+
+##unsorted bin
