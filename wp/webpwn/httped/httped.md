@@ -1,6 +1,8 @@
-第一次写webpwn的题目，选了各简单点的处理服务器的题。
+第一次写webpwn的题目，选了个简单点的处理服务器的题。
 
 main函数只是一些连接打包函数作为web服务器的初始化处理，就不用管了。
+
+这里引入一篇关于webpwn的文章https://www.anquanke.com/post/id/204404，里面解释了webpwn与传统pwn的区别。也就是下面为什么要用反弹shell
 
 ```
 unsigned __int64 __fastcall start_routine(void *fd)
@@ -76,36 +78,92 @@ unsigned __int64 __fastcall start_routine(void *fd)
 
 主要函数之一，主要是讲请求进行分类，分为POST，GET请求进行分别处理。
 
-可以看到请求主要结构为{请求类型 /目录？各种参数}
-
-审查所有函数，发现sub_1EB2函数里有大量泄露与任意地址读写。
-
-之后就是想着怎么进入这个函数了。ctrl+x查看调用，发现，sub_1DBE函数调用了这个函数， start_routine函数调用位置在这。
+我分段解析一下（recv_all函数接收到的是换行，具体的我就不贴出来了）。
 
 ```
-  if ( v2 )
+ n0xFD_2 = (int)recv_all((unsigned int)fd, (__int64)s2, 1024);
+  for ( n0xFD = 0; ((*__ctype_b_loc())[s2[n0xFD]] & 0x2000) == 0 && n0xFD <= 0xFD; ++n0xFD )
+    httpidea[n0xFD] = s2[n0xFD];
+  n0xFD_1 = n0xFD;
+  httpidea[n0xFD] = 0;
+  if ( !strcasecmp(httpidea, "GET") || !strcasecmp(httpidea, "POST") )
+```
+
+这里接收的请求被储存在了s2里面，这个for循环就是将请求的第一个部分拆出来分开处理。拆出来的部分放在了httpidea，n0xFD_1则保证了下一次再去拆分请求前面已经拆分过的部分不会被再次拆分。
+
+```
+  while ( ((*__ctype_b_loc())[s2[n0xFD_1]] & 0x2000) != 0 && n0xFD_1 < n0xFD_2 )
+      ++n0xFD_1;
+    while ( ((*__ctype_b_loc())[s2[n0xFD_1]] & 0x2000) == 0 && n0xFD_3 <= 0xFD && n0xFD_1 < n0xFD_2 )
+      v10[n0xFD_3++] = s2[n0xFD_1++];
+    v10[n0xFD_3] = 0;
+```
+
+这就是第二次拆分了，先把n0xFD_1也就是s2此时还未拆分部分的头脚标移动到第一个不是空格的地方。
+
+之后拆出来的部分会被放在v10[n0xFD_3]里面。前面对于post的识别只改了识别符。
+
+先进入get请求处理里面看
+
+```
+for ( url = v10; *url != 63 && *url; ++url )
+        ;
+      if ( *url == 63 )
+      {
+        v2 = 1;
+        *url++ = 0;
+      }
+```
+
+对发送的url进行再次分离，以？为界。后面会对v10前面添加htdocs。
+
+```
+ if ( file_[strlen(file_) - 1] == 47 )
+      strcat(file_, "index.html");
+```
+
+这个是为了防止get请求请求的是目录，所以加上index.html，也就是说你如果用get请求发送目录路径就会返回网页源码。
+
+```
+if ( (unsigned int)__xstat_w(&stat_buf) == -1 )
+    {
+      while ( n0xFD_2 && strcmp("\n", s2) )
+        n0xFD_2 = (int)recv_all((unsigned int)fd, (__int64)s2, 1024);
+      if ( v2 )
         sub_1DBE((unsigned int)fd, file_, httpidea, (__int64)url);
       else
         sub_28CF((unsigned int)fd);
+    }
 ```
 
-V2需要为正，也就是请求类型需要为POST类型。
-
-之后需要
+再然后就是对文件进行校验。
 
 ```
 (unsigned int)__xstat_w(&stat_buf) == -1
 ```
 
-__xstat_w函数需要目录不为文件，而是文件夹（路径）
+__xstat_w函数会验证文件是否可以打开（也就是是否存在）。
+
+```
+while ( n0xFD_2 && strcmp("\n", s2) )
+        n0xFD_2 = (int)recv_all((unsigned int)fd, (__int64)s2, 1024);
+```
+
+验证s接收的请求是否已经耗尽。也就是？后面有没有东西。
+
+此时，如果以上的一切都成功，并且是POST请求。就会进入下面的函数。
 
 ![image-20260515201017730](images/image-20260515201017730.png)
+
+只有是submit.cgi这个文件才会进入到我们下面的漏洞函数。
 
 这里追踪url可以看到这里对url参数进行了一定的处理。
 
 这个函数是解密函数，也就是说这里传入函数的url是密文。具体的加密过程我就不讲了。
 
-之后有submit.cgi的检查。
+之后的选项依赖的就是url
+
+url会被分成不同部分，通过数组进行查找赋值，包括第一个位置的cmd，以及之后要进行操作的数据。
 
 ```
   if ( *(__int64 *)&url_c[7 * i + 2] <= 4 )
