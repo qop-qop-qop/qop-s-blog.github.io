@@ -37,10 +37,8 @@ unsorted bin不会对大小进行分类，所以被储存在里面的chunk是可
 
 这里还有一点关于libc的，第一个被放入的unsorted bin的会跟libc里面的main_arena相连。所以如果可以打印被释放的堆块信息，可以通过这样泄露libc地址。
 ## Tcache
-
-与fastbin类似以单链连接，但是只能储存7个堆块且多线程之间不互通。2.26版本几乎没有防护检查。2.27版本引入key防止double free。
-2.31版本分配时强制检查count>0。2.32版本引入指针异或加密。
-2.34版本key变为数。
+tcache在程序运行的时候会被分配到一个结构体，结构体里面储存的有两个数组count，addr。count数组用于去储存每种大小堆块的数量。addr里面储存的则是下一个将要分配的地址。
+与fastbin类似以单链连接，但是每一个大小只能储存7个堆块且多线程之间不互通。2.26版本几乎没有防护检查。2.27版本引入key防止double free。2.31加强了对count数组的检查，不会再出现负数溢出的情况。2.32引入safe—Link((pos >> 12)^ptr)以防止tcache poisoning。
 
 ## Top chunk
 
@@ -73,3 +71,7 @@ fastbins对于double free会有一个简单的防护，它会检查被放入的c
 ## fastbins attack
 
 利用堆溢出去修改被放入fastbins里面的堆块的fd，从而实现控制任意内存区域的目的。
+
+## tcache poison
+涉及到tcache的基本利用，tcache的fd头被用于储存下一个堆块的数据区。并且tcache在分配的时候不会去查看size头是否合法。所以可以通过double free，uaf或者任意地址写入去更改这个fd以实现对整个tcache的堆块分配链的投毒（也就是控制）。第一版的key防护，只需要去破坏key这个指针就行了。而之后引入随机数也就是2.34+，虽然key从一个固定的数变为了一个随机数，但是整体的检查没有变依旧是历遍整个数组查看是否相等。
+
