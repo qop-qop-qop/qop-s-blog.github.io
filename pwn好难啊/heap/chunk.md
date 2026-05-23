@@ -2,13 +2,17 @@
 
 chunk有两个部分组成，头区跟数据区。头区又由**`prev_size`**跟**`size`**组成。
 
-prev_size会在前一个堆块被释放后记录其大小（进入fastbin除外），主要利用于合并相邻堆块。
+prev_size会在前一个堆块被释放后记录其大小（进入fastbin，tcache除外），主要利用于合并相邻堆块也被用来指示被释放堆的范围。
 
-size则指示当前堆块的大小，包含数据区与头区，在堆块被使用时会加1个字节表明堆块正在被使用中。
+有时候可以通过伪造p头加上更改p头实现已释放地址拦截。
+
+size则指示当前堆块的大小，包含数据区与头区，在堆块被使用时会加1个字节（这个1实际上是检查二进制的最后一位）表明上一个堆块正在被使用中。
 
 数据区是储存输入数据的区域，再被释放后用于储存fd跟bk。
 
-chunk对头区的检查比较严格，伪造chunk就是伪造头区。**在跳转到其他区域实现读写时必须要有合法的头区**。
+chunk对头区的检查比较严格，伪造chunk就是伪造头区。
+
+
 
 # bins
 
@@ -16,7 +20,7 @@ free之后堆块的去向。大多数堆漏洞都与这个有关。
 
 ## Fastbins
 
-在堆块小于一定数值的时候会被放入（64位是0x20 ~ 0x80，32位是0x10 ~ 0x80）。
+在堆块小于一定数值的时候会被放入（64位是0x20 ~ 0x80，32位是0x10 ~ 0x80，**注意这里的值是可以被程序更改的，审查代码的时候要注意**）。
 
 不同大小的堆块会被单链表串联，free之后数据区只会有fd。
 
@@ -39,6 +43,18 @@ unsorted bin不会对大小进行分类，所以被储存在里面的chunk是可
 ## Tcache
 tcache在程序运行的时候会被分配到一个结构体，结构体里面储存的有两个数组count，addr。count数组用于去储存每种大小堆块的数量。addr里面储存的则是下一个将要分配的地址。
 与fastbin类似以单链连接，但是每一个大小只能储存7个堆块且多线程之间不互通。2.26版本几乎没有防护检查。2.27版本引入key防止double free。2.31加强了对count数组的检查，不会再出现负数溢出的情况。2.32引入safe—Link((pos >> 12)^ptr)以防止tcache poisoning。
+
+## smallbin
+
+管理结构类似于tcache，都是每个大小的堆块分开管理。
+
+但是不一样的是，smallbin里面堆块之间是双链表连接，每个链表之间连接又类似于unsortedbin。
+
+## largebin
+
+largebin是最复杂的，里面有两个链表，一个用来快速查找，所以链表里面串联的是每个大小堆块最后放入的堆块，指针是fd_nextsize,bk_nextsize。
+
+另一个是用来保证堆块完整的，以双链表连接所有堆块，并且对堆块之间进行降序排序。
 
 ## Top chunk
 
@@ -74,4 +90,54 @@ fastbins对于double free会有一个简单的防护，它会检查被放入的c
 
 ## tcache poison
 涉及到tcache的基本利用，tcache的fd头被用于储存下一个堆块的数据区。并且tcache在分配的时候不会去查看size头是否合法。所以可以通过double free，uaf或者任意地址写入去更改这个fd以实现对整个tcache的堆块分配链的投毒（也就是控制）。第一版的key防护，只需要去破坏key这个指针就行了。而之后引入随机数也就是2.34+，虽然key从一个固定的数变为了一个随机数，但是整体的检查没有变依旧是历遍整个数组查看是否相等。
+
+## unsortedbin attack
+
+victim（要取出unosrtedbin的堆）fwd（已经控制指针的堆）
+
+```
+victim = unsorted_chunks(av)->bk;  // 取出块
+bck = victim->bk;                  // 获取目标块的 bk 指针
+unsorted_chunks(av)->bk = bck;     // 将链表头指向目标块的 bk
+bck->fd = unsorted_chunks(av);     // 将目标块 bk 指向的块的 fd 指针指向链表头
+```
+
+伪代码简化。
+
+这里整个伪代码的过程是unsortedbin最后一块取出时发送的fd跟bk指针的变化。
+
+我们知道正常情况下，第一块储存的都是mian_arena的地址。当最后一块取出的时候，glibc尝试将这个指针复原到最初的状态也就是自己指向自己，在低版本下堆管理器(<2.30)会在最后一步去检查这一过程的完整性于是会有一个双指针的查找。这个攻击方式正是利用了这一点。
+
+通过控制bk就能实现向任意地址写入**mian_arena的地址**。
+
+这里还会有一个副作用，当然也是扩大漏洞点的地方，我们写入数据的地方会被作为堆块并入unsortedbin里面。也就是说之后如果我们不能完善这个地方的堆块伪造unsorted就无法再申请出来堆块了。但是如果我们完善了这个伪造堆块就可以在这申请堆块。
+
+## largebin attack
+
+largebin有两个指针，也就是有了两个攻击点。如果能完全控制这两个指针就能实现任意地址写入**堆地址**。
+
+伪代码简化
+
+victim（要插入largebin的堆）fwd（已经控制指针的largebin堆）
+
+```
+victim->fd_nextsize = fwd;
+victim->bk_nextsize = fwd->bk_nextsize;
+
+if (fwd->bk_nextsize != NULL) {
+    fwd->bk_nextsize->fd_nextsize = victim;   ////这里控制了bk_nextsize就行
+fwd->bk_nextsize = victim;                  
+
+// 同时还会操作 fd/bk 链表
+victim->fd = fwd;
+victim->bk = fwd->bk;
+fwd->bk->fd = victim;			//这里控制了bk就行
+fwd->bk = victim;
+```
+
+与unsortedbin attack一样，整个利用过程产生的原因还是因为完整性检查。
+
+触发条件是要有一个大于已经控制指针的堆块去插入到这个已控制堆块之前。就会进行两个链表指针的操作。
+
+
 
