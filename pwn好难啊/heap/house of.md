@@ -13,8 +13,10 @@ force必须能控制topchunk的size段。
 利用的是free不会去验证释放地址是否是堆区（其实好像也验证）去释放非堆区（前提是要在特定的地方伪造头区），之后就可以再次申请获得地址权限。
 当然所需漏洞面也比较大，正常情况来说很难利用此法完成攻击，所以要多考虑与其他手法结合。首先你要有所需的地址（pie防护的普及使我们必须先完成泄漏）之后你要能控制free的变量这个倒是还好。之后的堆溢出有时候确实很少有这么大字节的溢出。
 
-## house of lore
+## house of orange
 
+应对无free漏洞去获取到释放的堆块。我们知道当我们去申请大于top chunk的堆块时会触发sysmalloc。正常情况下sysmalloc能正确利用top chunk找到堆区的边界然后去扩展堆区。但是如果我们更改了top chunk的size大小，sysmalloc就会识别到top chunk已经损坏没办法找到堆区的边界。于是为了不破坏整个数据区，就会重新分配一个堆区去适应我们申请的大小，而原先的top chunk会被放入unsorted bin等待分配。
+所以这里至少要控制top chunksize段的一个字节，把top chunk改小。而后我们还要有申请任意大小堆块的能力。
 
 ## house of strom
 
