@@ -1,14 +1,14 @@
 依旧是菜单题目。但是没有free函数。
 
-<img src="images\image-20260710182757415.png" alt="image-20260710182757415" style="zoom:50%;" />
+<img src="images/image-20260710182757415.png" alt="image-20260710182757415" style="zoom:50%;" />
 
 add函数，num变量仅仅用来记录使用函数的次数不进行寻址，所以只能操作同一个堆块。使用了malloc函数，存在未初始化数据。
 
-![image-20260710182946709](images\image-20260710182946709.png)
+![image-20260710182946709](images/image-20260710182946709.png)
 
 show函数里面用了%s来打印，存在泄漏点。
 
-![](images\1.png)
+![](images/1.png)
 
 edit函数可以重置堆块输入大小，存在堆溢出。并且跟add函数一样存在使用次数的限制。
 
@@ -22,7 +22,7 @@ edit函数可以重置堆块输入大小，存在堆溢出。并且跟add函数�
 
 之后在堆块上伪造IO结构体，因为版本为2.23，所以可以直接去伪造虚表。
 
-<img src="images\2.png" alt="image-20260710185045259" style="zoom:50%;" />
+<img src="images/2.png" alt="image-20260710185045259" style="zoom:50%;" />
 
 可以看到第一个chain里面指向下一个chain位置刚好指向我们控制的堆块。
 
