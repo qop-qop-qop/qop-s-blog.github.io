@@ -116,6 +116,8 @@ static void shadow_mode(void)
     out_hex(page_pa(shadow));
     out_str(" status_va=");
     out_hex((unsigned long)&g_shadow_status);
+    out_str(" status_phys=");
+    out_hex(page_pa((unsigned long)&g_shadow_status & ~0xFFFUL));
     out_str("\n");
 
     /* v2 主循环：三态输出——status / 调用结果（执行视图）/ CRC 自检（读取视图） */

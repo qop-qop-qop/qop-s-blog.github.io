@@ -1,4 +1,4 @@
-obj-m += shadow_v1.o shadow_v2.o
+obj-m += shadow_v1.o shadow_v2b.o
 KDIR ?= /root/kernel/src
 
 all:
