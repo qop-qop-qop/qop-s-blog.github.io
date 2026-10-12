@@ -33,7 +33,8 @@ struct caoin_cfg {
     u64 status_va;
     u64 find_task, probe_read, printk;   /* printk：KP 干扰，仅应急 */
     u64 status_phys;   /* 第二判据：status 页物理（双 expect 防假阳性） */
-    u64 unused[7];
+    u64 p_probe_write; /* probe_kernel_write */
+    u64 unused[6];
     /* 运行态 */
     u64 orig_pte;
     u64 mm_off, pgd_off;
@@ -51,6 +52,7 @@ static struct caoin_cfg caoin_cfg_block = {
 };
 
 static long (*caoin_probe)(void *, void *, unsigned long);
+static long (*caoin_pwrite)(void *, const void *, unsigned long);
 static int (*caoin_printk)(const char *fmt, ...);
 #define CK_LOG(...) do { if (caoin_printk) caoin_printk(__VA_ARGS__); } while (0)
 
@@ -132,7 +134,8 @@ static void caoin_write_status2(unsigned long mm, unsigned long pgd_off,
         return;
     phys = pte_v & PHYS_MASK & PAGE_MASK;
     u64 *slot = (u64 *)__va(phys + (va & ~PAGE_MASK));
-    *slot = val;
+    if (caoin_pwrite)
+        caoin_pwrite(slot, &val, 8);   /* 防御写：假阳性只失败不损坏 */
     asm volatile("dsb ish" ::: "memory");
 }
 
@@ -295,6 +298,7 @@ static int __init caoin_init(void)
         return -EINVAL;
 
     caoin_probe = (void *)(unsigned long)c->probe_read;
+    caoin_pwrite = (void *)(unsigned long)c->p_probe_write;
     caoin_printk = (void *)(unsigned long)c->printk;
     find_task = (void *)(unsigned long)c->find_task;
     task = find_task((int)c->target_pid);
@@ -309,6 +313,8 @@ static int __init caoin_init(void)
     c->mm_off = mm_off;
     c->pgd_off = pgd_off;
     c->pte_addr = pte_a;
+    caoin_write_status2(mmv, pgd_off, (unsigned long)c->status_va, 0x5);   /* 组合锁定 */
+    CK_LOG("caoin2b: combo locked mm=%lx pgd=%lx pte=%lx\n", mm_off, pgd_off, pte_a);
 
     if (caoin_probe(&orig_pte_v, (void *)pte_a, 8))
         return -ENOENT;
@@ -335,10 +341,20 @@ static int __init caoin_init(void)
     asm volatile("isb" ::: "memory");
     c->vbar_on = 1;
 
-    /* 切 shadow 视图 */
+    /* 切 shadow 视图（先预检 pte 位置可写：原值回写测试） */
+    {
+        unsigned long cur_v = 0;
+        caoin_probe(&cur_v, (void *)(unsigned long)c->pte_addr, 8);
+        if (caoin_pwrite((void *)(unsigned long)c->pte_addr, &cur_v, 8) != 0) {
+            CK_LOG("caoin2b: pte slot not writable, bail\n");
+            return -EINVAL;
+        }
+    }
     set_pte((pte_t *)(unsigned long)c->pte_addr, __pte((unsigned long)c->shadow_pte_val));
     c->cur_view = 1;
     caoin_tlb_flush((unsigned long)c->target_va);
+    caoin_write_status2(mmv, pgd_off, (unsigned long)c->status_va, 0x6);   /* PTE 已换 */
+    CK_LOG("caoin2b: pte switched\n");
 
     /* 读回验证：PTE 实际值编码写 status（0xA0000000 + 低 20 位） */
     {
@@ -350,7 +366,7 @@ static int __init caoin_init(void)
                (unsigned long)c->shadow_pte_val, back, (unsigned long)c->pte_addr);
     }
 
-    caoin_write_status2(mmv, pgd_off, (unsigned long)c->status_va, 0x1);
+    caoin_write_status2(mmv, pgd_off, (unsigned long)c->status_va, 0x7);   /* 全部就绪 */
     CK_LOG("caoin2b: on (vbar %lx -> %lx)\n", old_vbar, (unsigned long)caoin_vbar);
     return 0;
 }
