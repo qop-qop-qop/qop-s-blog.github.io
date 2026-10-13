@@ -54,6 +54,19 @@ static unsigned long page_pa(unsigned long va)
     return (entry & 0x7FFFFFFFFFFFFFULL) << 12;
 }
 
+/* shadow 页写桩后的 cache 维护：脏 D-cache 行清到 PoU + I-cache 全失效。
+   没有这一步，换视图后取指拿到的是 RAM 陈旧内容（脏行未写回）。 */
+static void shadow_cache_maint(unsigned long va, unsigned long len)
+{
+    unsigned long off;
+    for (off = 0; off < len; off += 64) {
+        asm volatile("dc cvau, %0" :: "r"(va + off));
+        asm volatile("ic ivau, %0" :: "r"(va + off));
+    }
+    asm volatile("dsb ish" ::: "memory");
+    asm volatile("isb" ::: "memory");
+}
+
 static void out_hex(unsigned long v)
 {
     char b[24];
@@ -80,18 +93,17 @@ static void shadow_mode(void)
     for (int i = 0; i < 512; i++)
         snap[i] = ((unsigned long *)code)[i];
 
-    /* v2 桩：MOVZ/MOVK X16 拼 64 位地址（纯立即数，无数据访问——跷跷板下
-       LDR literal 的数据读会切到 original 视图读到错误字节）+ BR X16 */
+    /* v2c 桩：BRK #0xCA0（跷跷板 BRK+单步模型）。
+       BRK 在 X-only 页正常执行（指令非数据访问）；
+       模块 BRK handler 切 STEPPING 视图（original 可执行 RO）+ 开硬件单步；
+       单步异常后切回 SHADOW_X。handler 逻辑全在内核侧。 */
     for (int i = 0; i < 512; i++)
         ((unsigned long *)shadow)[i] = snap[i];
     unsigned long off_in_page = (unsigned long)(void *)caoin_target & 0xFFFUL;
-    unsigned long ht = (unsigned long)(void *)shadow_handler;
     unsigned int *stub = (unsigned int *)(shadow + off_in_page);
-    stub[0] = 0xD2800010u | (unsigned)((ht & 0xFFFF) << 5);          /* MOVZ X16,#imm0 */
-    stub[1] = 0xF2A00010u | (unsigned)(((ht >> 16) & 0xFFFF) << 5);  /* MOVK X16,#imm1,LSL16 */
-    stub[2] = 0xF2C00010u | (unsigned)(((ht >> 32) & 0xFFFF) << 5);  /* MOVK X16,#imm2,LSL32 */
-    stub[3] = 0xF2E00010u | (unsigned)(((ht >> 48) & 0xFFFF) << 5);  /* MOVK X16,#imm3,LSL48 */
-    stub[4] = 0xD61F0200u;                                           /* BR X16 */
+    stub[0] = 0xD4200000u | (0xCA0 << 5);   /* BRK #0xCA0 */
+    stub[1] = 0xD503201Fu;                  /* NOP（单步落点） */
+    shadow_cache_maint(shadow, 4096);
 
     out_str("CFG");
     unsigned long pid = 0;

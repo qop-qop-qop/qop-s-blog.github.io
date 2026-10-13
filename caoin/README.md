@@ -63,7 +63,7 @@ linker 不拦 /data/local/tmp 的 so；app 域对该目录无写权限，回传�
 - [x] **P1**：inline hook 原语（B/BL、ADR/ADRP 正负偏移、CBZ/TBZ、LDR literal；主机单测 + 真机 ALU/ADRP 序言双验证）
 - [x] **P2**：注入器（ptrace + 远程 __loader_dlopen + memfd 隐匿加载）+ agent（零依赖自解析）+ CLI 配置化——真机三组行为级验证全过
 - [x] **P3-v1**：内核换页 hook（幽灵模块路线，见下）
-- [ ] **P3-v2**：X-only 权限 + fault 跷跷板（读写分离：校验读原页，执行走桩页）
+- [~] **P3-v2**：X-only 权限 + fault 跷跷板（读写分离：校验读原页，执行走桩页）——v2b VBAR 路线：模块加载/自隐藏/解隐藏/PTE 换页/VBAR 切换全通，**hook 跷跷板有 livelock 待解**（见 v2b 实测记录）
 - [ ] 后置：Java 层下沉的 ArtMethod 全覆盖；app 进程注入实战（ll 壳对抗）
 
 ## P3 内核换页（caoin_ko/，v1 已通）
@@ -76,6 +76,25 @@ linker 不拦 /data/local/tmp 的 so；app 域对该目录无写权限，回传�
 **本 ROM 内核特殊性（踩坑实录）**：39 位 VA / 3 级页表（PAGE_OFFSET=0xffffffc000000000，基座树 48 位完全不同）；slab/task_struct 在 vmalloc 区（0xffffffca...）；两次 panic 教训（未 patch 空指针、结构偏移裸解引用）→ 全路径安全读。
 
 v1 = 换页版（执行与读取同走 shadow 页）；v2 读写分离后，配合 agent 的 memfd 加载即为对 ll 壳双层检测的完整解。
+
+## v2b 真机实测（2026-10-13，MI 8 Pro / equuleus 4.9.337 / Android 13）
+
+**已闭环**：
+- 模块加载 → PTE 定位（probe walk + pagemap 双判据）→ PTE 换 shadow 视图（--x）→ VBAR 换表 → **自隐藏**（init 尾部 kobject_del + list_del，地址全走 cfg 注入）全通
+- **解隐藏**：目标进程 status 页写 `0xCA0F0001` → 模块内 timer_list（地址 cfg 注入）每秒轮询 → list_add 挂回原位（保存的 list.prev，不引用 modules 符号）→ rmmod 正常。`/proc/pid/mem` 写 status 页即可远控
+- 内核触碰面：一次 `msr vbar_el1` + 目标进程 PTE 读写 + 一次 kobject_del，零内核符号引用（仅工具链固有 3 个：__stack_chk_fail/__stack_chk_guard/memstart_addr）
+
+**当前卡点（livelock）**：insmod 后目标进程冻结——R 态、stime 持续增长、status 页实测已被模块写为 0x8 但进程不再输出；filter 零 reject（所有 fault 均 handled），即"处理→eret→重 fault"死循环。flt# 采样版（前 30 次 fault 打印 v/ec/dfsc/far）已编译待真机验证。注意：**rmmod 前必须先 kill 卡死的目标**——目标核还在向量表处理中时卸载模块（释放 .text）→ panic。
+
+**踩坑实录（新增）**：
+- **本树 `init_timer_key` 是 4 参定制版**（timer, flags, name, key，无 func）——按 mainline 5 参调用 → function 未赋值 → `mod_timer` BUG_ON (timer.c:958) → panic。function 需单独赋值
+- **patch_cfg2b.py 参数顺序**：struct 里 find_task/probe_read/printk 在前、status_phys 在后（status_phys 不在 sva 和 find_task 之间）。参数顺序写反 → find_task 槽装进 status_phys → init 直接 BLR 到物理地址 → Oops（pstore 定位 `pc=<status_phys>`）。pid 收 `0x` 格式防手算换基错误
+- **用户态写代码页后必须 cache 维护**：逐行 `dc cvau` + `ic ivau` + dsb/isb。漏做则换视图后取指拿到 RAM 陈旧内容（脏行未写回）→ 执行垃圾指令。**`ic iallu` 在 EL0 非法**（UCI 不放行 IC IALLU）→ SIGILL
+- **模块名 ≠ 设备文件名**：/proc/modules、/sys/module、kallsyms 用 .ko 内部名（shadow_v2b），insmod 成不同文件名不改变名字——排查时按内部名 grep
+- **KASLR 开启**：每次开机 slide 不同，符号地址只能开机后从 /proc/kallsyms 取。kptr_restrict=2 且 sysctl 写入被 MIUI 加固：需 Permissive + dd 写（echo > 重定向会 EPERM），且 folkpatch 守护起来之前写不进——开机后要等/重试
+- **panic 取证走 pstore**：/sys/fs/pstore/dmesg-ramoops-*（各 CPU PC、Kernel Offset 全在）；adb 会周期性假死（kill adb 进程重启 daemon 即可，别误判成设备翻车）
+
+**wxshadow 对照**（F:\work\tmp\mkpms，KP 生态）：机制同源（用户态代码页 shadow、读 fault 切原页、执行走 shadow），但它是 KPM——需要 KP patched 内核（本测试机未装，insmod 幽灵模块路线不需要）；其 per-page 全局翻转 + STEPPING 忙等（retry 10000）可对照；其 GUP（follow_page_pte）/fork（copy_process）/exit_mmap 伴侣钩子是 v2b 缺的，后续移植参考。
 
 ## 注意
 
