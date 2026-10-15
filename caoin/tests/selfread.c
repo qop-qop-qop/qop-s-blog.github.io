@@ -167,6 +167,17 @@ long st_hooked2(long x)
     return st_helper(x + 100);
 }
 
+asm(".pushsection .st2.text, \"ax\"\n.fill 16, 1, 0\n.popsection");
+
+/* 双参数函数：验证 argN= 真的改到了 x1（而不是只改 x0）。
+ * st_hooked3(n, 1000) 未 hook 时 = 3*(n+1000)+7 = 3n+3007；
+ * 用 arg1=0x0 把 x1 压成 0 → 应变成 3n+7。 */
+__attribute__((noinline, used, visibility("default"), section(".st2.text")))
+long st_hooked3(long a, long b)
+{
+    return st_helper(a + b);
+}
+
 /* 尾部填充必须让本段总长 >= 4096，否则紧随其后的 .rodata 会挤进同一页
  * （实测 fill 4000 时总长 4072，.rodata 落到 0x4ff0 = st_hooked2 所在页）。 */
 asm(".pushsection .st2.text, \"ax\"\n.fill 4100, 1, 0\n.popsection");
@@ -304,6 +315,8 @@ void _start(void)
     out_str(" hooked2_off="); out_hex((unsigned long)(void *)st_hooked2 & 0xFFFUL);
     out_str(" xpage="); out_hex((unsigned long)(void *)st_xpage);
     out_str(" xpage_off="); out_hex((unsigned long)(void *)st_xpage & 0xFFFUL);
+    out_str(" hooked3="); out_hex((unsigned long)(void *)st_hooked3);
+    out_str(" hooked3_off="); out_hex((unsigned long)(void *)st_hooked3 & 0xFFFUL);
     out_str(" reader="); out_hex(rp);
     out_str(" reader_off="); out_hex(rp & 0xFFFUL);
     out_str(" outpage_reader="); out_hex((unsigned long)(void *)st_reader_outpage);
@@ -336,6 +349,7 @@ void _start(void)
         out_str(" mode="); out_int(mode);
         out_str(" hooked="); out_int(st_hooked(round));
         out_str(" hooked2="); out_int(st_hooked2(round));
+        out_str(" hooked3="); out_int(st_hooked3(round, 1000));
         out_str("\n");
 
         /* C1：读指令在页外，读受管页（对照，等价 shellwatch 的 sw_crc） */

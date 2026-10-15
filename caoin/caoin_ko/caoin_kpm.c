@@ -65,6 +65,22 @@ static volatile u64 ec20_cnt, ec24_cnt, sent_cnt;
 /* 方案 D 计数：selfread_ok = 自指访问被软件模拟成功（不翻转）；
  * selfread_fb = 形态不认识、回退到翻转（可能活锁，用于定位漏掉的编码） */
 static volatile u64 selfread_ok_cnt, selfread_fb_cnt;
+
+/* ---- 并发插桩 ----
+ * 把"无锁竞态"从推演变成可数。前提：翻转是幂等的（每个状态写固定 PTE 值），
+ * 所以同方向的并发翻转无害；危险的是反方向交错导致 cur_view 与 PTE 脱同步。
+ * 脱同步的两个可观测特征（都走 caoin 现有的"非预期分支"）：
+ *   desync_a：cur_view==SHADOW 却收到取指 fault（SHADOW 可执行，取指不该 fault）
+ *   desync_b：cur_view==STEP  却收到数据 fault（STEP 可读，读不该 fault）
+ * overlap：进入受管页 handler 时已有别的 CPU 在里面 —— 并发进入的直接证据。
+ * 用法：verbose=1 时每 262144 条打一次；卸载时无条件打一次（不依赖 ctl0）。 */
+static volatile u64 g_entries, g_overlap, g_desync_a, g_desync_b;
+static volatile int g_in_mh;
+/* engage 诊断：受管页帧上的 fault 总数（含被 is_target_proc 拒掉的）。
+ * 非零但 entries==0 → 说明 fault 被"他进程"判据放行了（那会走 native 路径
+ * 把 PTE 修回原页 → hook 静默失效）。两者都为 0 → 根本没有 fault → 是 TLB
+ * 一直用旧翻译（PTE 已翻但没生效）。 */
+static volatile u64 g_mf_seen, g_mf_nottarget;
 /* 内核侧页分配（方案：影子页/status 页下沉，消掉目标 maps 里的 2 条匿名 VMA）。
  * GFP_KERNEL=0xcc0：与 wxshadow 同生态实测值（__get_free_pages 的 flags 是
  * 数值宏，不在 kallsyms 里，只能取经验值——wxshadow 在同类内核上用同一个数）。 */
@@ -110,14 +126,31 @@ static u64 g_verbose;   /* verbose=1 开流程日志；默认静音（无痕优�
 static void *g_copy_process;   /* fork 防护 hook 目标（装不上为 NULL） */
 static u64 g_stub_onload;      /* stub=1：加载即装桩（跳过 INJ_REQ 握手，
                                 * 供 caoin_prep 自动化流程——目标不发请求） */
-/* recstub 的"改参数"规格：arg0=<val> 时 handler 先把 x0 改成该值再跑原函数。
- * 没给就退化成纯透传（handler 只剩一条 b trampoline）。
+/* recstub 的"改参数"规格：argN=<val>（N=0..7）时 handler 先把 xN 改成该值再跑
+ * 原函数。没给就退化成纯透传（handler 只剩一条 b trampoline）。
  * 注意这里刻意**不记录参数**：观察型需求走 caoin-hw（KPM 每次命中都能读寄存器，
  * 零足迹）；影子路线做"改行为"。理由是报告区在受管页内会矛盾——SHADOW 视图下
  * 该页 EL0 无数据访问，桩的 str 要么 fault、要么（翻到 STEP 后）写进原页污染
  * 代码段、破坏 CRC 自检。 */
-static u64 g_arg0;
-static int g_has_arg0;
+#define CAOIN_MAX_ARGS 8
+static u64 g_args[CAOIN_MAX_ARGS];
+static int g_has_arg[CAOIN_MAX_ARGS];
+static int g_nargs_installed;
+
+/* 按需生成 movz/movk 序列（高位全零的 movk 跳过）。movz 会清整个寄存器，
+ * 所以跳过后面的零 movk 是正确的。返回写入的指令数。 */
+static int caoin_emit_movx(u32 *dst, int rd, u64 v)
+{
+    int n = 0;
+    dst[n++] = 0xD2800000u | ((u32)((v >>  0) & 0xFFFF) << 5) | (u32)rd;
+    if (v >> 16)
+        dst[n++] = 0xF2A00000u | ((u32)((v >> 16) & 0xFFFF) << 5) | (u32)rd;
+    if (v >> 32)
+        dst[n++] = 0xF2C00000u | ((u32)((v >> 32) & 0xFFFF) << 5) | (u32)rd;
+    if (v >> 48)
+        dst[n++] = 0xF2E00000u | ((u32)((v >> 48) & 0xFFFF) << 5) | (u32)rd;
+    return n;
+}
 
 /* 日志双档：CK_ERR 永远打（加载失败必须可见）；CK_LOG 默认静音。
  * ctl0 dump 不受门控（显式查询动作）。 */
@@ -658,7 +691,7 @@ int caoin_fault_check(unsigned long addr, struct pt_regs_49 *regs,
 {
     unsigned int ec = esr >> 26;
     unsigned long pc = regs ? regs->pc : 0;
-    int i;
+    int i, ret = 0;
 
     /* 取证：受管页/哨兵页 fault 限速记录。SENT 标记区分哨兵页；
      * 前 30 条无条件记录是系统杂散噪声 */
@@ -679,8 +712,23 @@ int caoin_fault_check(unsigned long addr, struct pt_regs_49 *regs,
         struct caoin_hook *h = &hooks[i];
         if ((addr >> 12) != (h->tva >> 12))
             continue;
-        if (!caoin_is_target_proc())
+        g_mf_seen++;
+        if (!caoin_is_target_proc()) {
+            g_mf_nottarget++;
             return 0;   /* 他进程同 VA：放行（勿吞勿翻，防活锁与视图污染） */
+        }
+
+        /* 并发插桩：进入受管页 handler（进出配平，统一从 mh_out 出去） */
+        g_entries++;
+        g_in_mh++;
+        if (g_in_mh > 1)
+            g_overlap++;
+        if (g_verbose && (g_entries & 0x3FFFF) == 0)
+            CK_LOG("caoin-kpm: conc entries=%llu overlap=%llu desync_a=%llu "
+                   "desync_b=%llu ec20=%llu ec24=%llu\n",
+                   (unsigned long long)g_entries, (unsigned long long)g_overlap,
+                   (unsigned long long)g_desync_a, (unsigned long long)g_desync_b,
+                   (unsigned long long)ec20_cnt, (unsigned long long)ec24_cnt);
 
         if (ec == 0x24)
             ec24_cnt++;
@@ -695,13 +743,33 @@ int caoin_fault_check(unsigned long addr, struct pt_regs_49 *regs,
          * SHADOW/STEP 无限振荡（tests/selfread.c 实测 ec=24/ec=20 严格交替）
          * → 改为软件模拟这次读，PTE 保持 SHADOW 不动。形态不认识时回退翻转。 */
         if (h->cur_view == VIEW_SHADOW) {
-            if (ec != 0x24)
-                return 0;   /* 非数据 fault：放行 */
+            if (ec != 0x24) {
+                /* 视图说 SHADOW（可执行）却收到**取指 permission fault** → TLB 陈旧：
+                 * 并发重填竞态让本核 TLB 里留着另一套翻译（指向原页），而原页既可读
+                 * 又可取指 → 永不 fault → 陈旧项永不自愈。
+                 * 原来这里 return 0 放行给原生路径，但原生路径不会 flush TLB（PTE
+                 * 本来就是"对的"）→ 同一份陈旧翻译反复 fault → 活锁。
+                 * 实测（tests/selfread.c mode=6，4 线程）：overlap 98.5%、
+                 * desync_a 98.4%、目标 state=R 空转、selfread_ok=0。
+                 * 改成 flush + eret 重试 —— 与下面 STEP+data 那条对称。
+                 * 只处理 permission fault（0b0011xx）：translation fault 说明 PTE
+                 * 真的无效，flush 救不了，仍然放行。 */
+                if (ec == 0x20 && (esr & 0x3C) == 0x0C) {
+                    g_desync_a++;
+                    caoin_tlb_flush(h->tva);
+                    last_hit_hi = i;
+                    ret = 1;
+                    goto mh_out;
+                }
+                ret = 0;
+                goto mh_out;
+            }
             if (regs && (regs->pc >> 12) == (h->tva >> 12)) {
                 if (caoin_emulate_selfread(h, regs, addr)) {
                     selfread_ok_cnt++;
                     last_hit_hi = i;
-                    return 1;   /* 已代读 + pc+=4，视图保持 SHADOW */
+                    ret = 1;   /* 已代读 + pc+=4，视图保持 SHADOW */
+                    goto mh_out;
                 }
                 selfread_fb_cnt++;   /* 未识别形态：回退翻转（可能活锁） */
             }
@@ -709,27 +777,36 @@ int caoin_fault_check(unsigned long addr, struct pt_regs_49 *regs,
             h->cur_view = VIEW_STEP;
             caoin_tlb_flush(h->tva);
             last_hit_hi = i;
-            return 1;   /* eret 重试 → orig 页成功 */
+            ret = 1;   /* eret 重试 → orig 页成功 */
+            goto mh_out;
         }
 
         /* STEP 视图：取指 fault（UXN）→ 切 SHADOW 恢复桩执行；
          * 数据 fault（TLB 陈旧命中 SHADOW 翻译）→ 重刷 TLBI 后 eret 重试 */
         if (h->cur_view == VIEW_STEP) {
             if (ec == 0x24) {
+                g_desync_b++;   /* STEP 可读却数据 fault：脱同步/TLB 陈旧 */
                 caoin_tlb_flush(h->tva);
                 last_hit_hi = i;
-                return 1;
+                ret = 1;
+                goto mh_out;
             }
-            if (ec != 0x20)
-                return 0;
+            if (ec != 0x20) {
+                ret = 0;
+                goto mh_out;
+            }
             caoin_flip_hook(i, VIEW_SHADOW);
             h->cur_view = VIEW_SHADOW;
             caoin_tlb_flush(h->tva);
             last_hit_hi = i;
-            return 1;   /* eret 重取指 → 替换桩 */
+            ret = 1;   /* eret 重取指 → 替换桩 */
+            goto mh_out;
         }
 
-        return 0;
+        ret = 0;
+mh_out:
+        g_in_mh--;
+        return ret;
     }
 
     return 0;   /* 非受管页：放行 */
@@ -896,7 +973,12 @@ static void parse_args(const char *args)
         else if (!strncmp(p, "verbose=", 8)) g_verbose = parse_hex(p + 8);
         else if (!strncmp(p, "stub=", 5)) g_stub_onload = parse_hex(p + 5);
         else if (!strncmp(p, "stubmode=", 9)) stub_mode = (int)parse_hex(p + 9);
-        else if (!strncmp(p, "arg0=", 5)) { g_arg0 = parse_hex(p + 5); g_has_arg0 = 1; }
+        else if (!strncmp(p, "arg", 3) && p[3] >= '0'
+                 && p[3] < '0' + CAOIN_MAX_ARGS && p[4] == '=') {
+            int ai = p[3] - '0';
+            g_args[ai] = parse_hex(p + 5);
+            g_has_arg[ai] = 1;
+        }
         else if (!strncmp(p, "tva=", 4)) hooks[0].tva = parse_hex(p + 4);
         else if (!strncmp(p, "shva=", 5)) hooks[0].shva = parse_hex(p + 5);
         else if (!strncmp(p, "tva1=", 5)) hooks[1].tva = parse_hex(p + 5);
@@ -1072,6 +1154,14 @@ static long caoin_restore(void)
             CK_ERR("caoin-kpm: kernel pages freed = %d\n", nf);
         }
     }
+    /* 并发插桩收尾：卸载时无条件打一次（不依赖 ctl0）。
+     * overlap > 0 且 desync_a/b == 0 → 并发进入确实发生过、且没脱同步。 */
+    CK_ERR("caoin-kpm: conc entries=%llu overlap=%llu desync_a=%llu desync_b=%llu "
+           "selfread_ok=%llu fb=%llu\n",
+           (unsigned long long)g_entries, (unsigned long long)g_overlap,
+           (unsigned long long)g_desync_a, (unsigned long long)g_desync_b,
+           (unsigned long long)selfread_ok_cnt,
+           (unsigned long long)selfread_fb_cnt);
     CK_LOG("caoin-kpm: off, restored (%d hooks)\n", hooks_n);
     return 0;
 }
@@ -1240,17 +1330,16 @@ static void caoin_install_recstub(int hi)
         unsigned long tramp = page_va + CAOIN_OFF_TRAMP;
         unsigned long hva   = page_va + CAOIN_OFF_HANDLER;
         long d;
-        int nh = 0;
+        int nh = 0, ai, nargs = 0;
 
-        if (g_has_arg0) {
-            u64 v = g_arg0;
-            dst[nh++] = 0xD2800000u | ((u32)((v >>  0) & 0xFFFF) << 5) | 0; /* movz x0 */
-            dst[nh++] = 0xF2A00000u | ((u32)((v >> 16) & 0xFFFF) << 5) | 0; /* movk lsl16 */
-            dst[nh++] = 0xF2C00000u | ((u32)((v >> 32) & 0xFFFF) << 5) | 0; /* movk lsl32 */
-            dst[nh++] = 0xF2E00000u | ((u32)((v >> 48) & 0xFFFF) << 5) | 0; /* movk lsl48 */
-        }
+        for (ai = 0; ai < CAOIN_MAX_ARGS; ai++)
+            if (g_has_arg[ai]) {
+                nh += caoin_emit_movx(&dst[nh], ai, g_args[ai]);
+                nargs++;
+            }
         d = (long)((tramp - (hva + (unsigned long)nh * 4)) >> 2);
         dst[nh++] = 0x14000000u | ((u32)d & 0x03FFFFFFu);                  /* b trampoline */
+        g_nargs_installed = nargs;
     }
 
     /* 4) cache 维护（线性地址，I-cache PIPT 等效） */
@@ -1265,10 +1354,9 @@ static void caoin_install_recstub(int hi)
     }
     status_mark(0xCA0FCA03ULL);
     CK_ERR("caoin-kpm: hook%d recstub installed page=%lx off=%lx handler=%lx "
-           "tramp=%lx(%lu insns) arg0=%s%lx\n",
+           "tramp=%lx(%lu insns) args=%d\n",
            hi, page_va, off, page_va + CAOIN_OFF_HANDLER,
-           page_va + CAOIN_OFF_TRAMP, n,
-           g_has_arg0 ? "0x" : "(none)", (unsigned long)g_arg0);
+           page_va + CAOIN_OFF_TRAMP, n, g_nargs_installed);
 }
 
 /* status 打标（经 status 页物理帧线性地址；帧 PFN=cfg_e2，init 自推导） */
@@ -1570,6 +1658,21 @@ static long caoin_init(const char *args, const char *event, void *__user reserve
         CK_LOG("caoin-kpm: stub=1 → %d stubs installed at load (mode=%d)\n",
                hooks_n, stub_mode);
     }
+    /* engage 修复：桩装完后**再 flush 一次**。安装早期的 flush 之后、桩写入
+     * 之前，目标仍在并发跑（多线程），本核/他核会重新走页表并把**旧**翻译填回
+     * TLB —— 而旧翻译指向原页（可读可取指），永不 fault，于是陈旧项永不自愈、
+     * seesaw 从不 engage（实测：mode=6 下 entries=0、hooked 仍是原值）。
+     * 补这一次 flush 后 hook 立刻生效。同时重新 walk 一次读回内存里的 PTE，
+     * 确认桩写入没把 PTE 碰掉。 */
+    for (i = 0; i < hooks_n; i++) {
+        unsigned long wa = 0, wv = 0;
+        if (caoin_walk_pgd_via_mm(hooks[i].tva, &wa)
+            && !kfn_probe_read(&wv, (void *)wa, 8))
+            CK_ERR("caoin-kpm: engage hook%d tva=%lx pte=%lx view=%d\n",
+                   i, hooks[i].tva, wv, (int)hooks[i].cur_view);
+    }
+    caoin_tlb_flush(0);
+
     CK_LOG("caoin-kpm: on (%d hooks, dpf hooked, seesaw armed)\n", hooks_n);
     return 0;
 }
