@@ -703,6 +703,11 @@ static void hw_apply_regs(struct hw_bp *b, struct pt_regs *regs)
         if (mask & (1ull << i)) regs->regs[i] = b->regs[i];
     if (mask & (1ull << HW_REG_SP)) regs->sp = b->regs[HW_REG_SP];
     if (mask & (1ull << HW_REG_PSTATE)) regs->pstate = b->regs[HW_REG_PSTATE];
+    /* PC 覆盖：调用方（hw_bp_before / hw_wp_before）一看到 PC 位就 skip_origin
+     * 且不单步，把"改 pc 后直接放行"当作既成事实。所以这里必须真的写 pc——
+     * 漏了这一行的话 pc 没变、槽还使能，那条指令原地重执行 → 断点再次命中 →
+     * 死循环。方案 A（硬件断点 + pc 重定向）就靠这一行成立。 */
+    if (mask & (1ull << HW_REG_PC)) regs->pc = b->regs[HW_REG_PC];
 }
 
 static void hw_record_hit(struct hw_bp *b, struct pt_regs *regs)
@@ -1131,6 +1136,7 @@ static int parse_reg(const char *s)
     if (s[0] != 'x' && s[0] != 'X') {
         if (s[0] == 's' && s[1] == 'p') return HW_REG_SP;
         if (s[0] == 'p' && s[1] == 'c') return HW_REG_PC;
+        if (s[0] == 'p' && s[1] == 's') return HW_REG_PSTATE;
         return -1;
     }
     return (int)parse_hex(s + 1);
@@ -1188,13 +1194,15 @@ static long hw_ctl_exec(char *buf)
         kind = (tok[0][3] == 'w') ? HW_BP_RW : HW_BP_EXECUTE;
         for (j = 3; j < ntok; j++) {
             char *eq = strchr(tok[j], '=');
-            if (eq && tok[j][0] == 'x') {
-                int r = parse_reg(tok[j]);
-                if (r >= 0 && r < HW_REG_SP) {
-                    *eq = 0;
-                    vals[r] = parse_hex(eq + 1);
-                    mask |= 1ull << r;
-                }
+            int r = -1;
+            /* 任何 <reg>=<val> 都试一次。parse_reg 只看 token 开头，'=' 不影响；
+             * 原来是 tok[j][0]=='x' 才进、且 r < HW_REG_SP，把 pc(=32)/sp(=31)/
+             * pstate(=33) 全挡掉了——方案 A 需要 pc。 */
+            if (eq) r = parse_reg(tok[j]);
+            if (eq && r >= 0 && r < HW_REG_NUM) {
+                *eq = 0;
+                vals[r] = parse_hex(eq + 1);
+                mask |= 1ull << r;
             } else if (!strcmp(tok[j], "if") && j + 1 < ntok) {
                 char *eq2 = strchr(tok[j + 1], '=');
                 if (eq2) {

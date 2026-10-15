@@ -195,13 +195,15 @@ static uintptr_t call_remote(pid_t pid, uintptr_t func, const uintptr_t args[6])
 
 static void usage(void)
 {
-    fprintf(stderr, "usage: caoin_prep <pid> <module_pat|@> <symbol>\n");
+    fprintf(stderr, "usage: caoin_prep <pid> <module_pat|@> <symbol> [nommap]\n"
+                    "  nommap: 不远程 mmap 影子页/status 页（交给 KPM 内核分配），\n"
+                    "          目标 maps 零新增 VMA，且全程不用 ptrace\n");
     exit(1);
 }
 
 int main(int argc, char **argv)
 {
-    if (argc != 4) usage();
+    if (argc != 4 && argc != 5) usage();
     pid_t pid = (pid_t)atoi(argv[1]);
     const char *module = argv[2];
     const char *symbol = argv[3];
@@ -219,6 +221,16 @@ int main(int argc, char **argv)
     if (!tva) DIE("symbol not found: %s", symbol);
     LOG("symbol %s = %llx (page off %llx)", symbol,
         (unsigned long long)tva, (unsigned long long)(tva & 0xFFF));
+
+    /* nommap：影子页 + status 页都交给 KPM 在内核分配（args 里不给 shva/sva）。
+     * 目标 maps 零新增 VMA，而且这条路径完全不用 ptrace——只读
+     * /proc/pid/maps 与 /proc/pid/mem。 */
+    if (argc > 4 && strcmp(argv[4], "nommap") == 0) {
+        printf("pid=0x%x tva=0x%llx\n",
+               (unsigned)pid, (unsigned long long)tva);
+        LOG("nommap: KPM will allocate shadow+status pages in kernel");
+        return 0;
+    }
 
     uintptr_t libc = find_module(pid, "libc.so");
     if (!libc) DIE("libc.so not found");

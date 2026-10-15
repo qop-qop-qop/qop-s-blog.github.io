@@ -62,6 +62,16 @@ static u64 mm_run, mm_off, pgd_off;
 static unsigned long mm_run_pgd;      /* 目标进程 pgd 指针(init 时锁定) */
 static unsigned long el0_table_base;  /* EL0 页表基址（哨兵发现，PA；0=未发现） */
 static volatile u64 ec20_cnt, ec24_cnt, sent_cnt;
+/* 方案 D 计数：selfread_ok = 自指访问被软件模拟成功（不翻转）；
+ * selfread_fb = 形态不认识、回退到翻转（可能活锁，用于定位漏掉的编码） */
+static volatile u64 selfread_ok_cnt, selfread_fb_cnt;
+/* 内核侧页分配（方案：影子页/status 页下沉，消掉目标 maps 里的 2 条匿名 VMA）。
+ * GFP_KERNEL=0xcc0：与 wxshadow 同生态实测值（__get_free_pages 的 flags 是
+ * 数值宏，不在 kallsyms 里，只能取经验值——wxshadow 在同类内核上用同一个数）。 */
+static unsigned long (*kfn_get_free_pages)(unsigned int, unsigned int);
+static void (*kfn_free_pages)(unsigned long, unsigned int);
+static u64 kstatus;            /* 内核分配的 status 页（线性地址）；0=用用户态 sva */
+#define CAOIN_GFP_KERNEL 0xcc0u
 
 /* ---- 注入请求协议 ----
  * 目标向 status 变量写 INJ_REQ → KPM 在目标 fault 上下文探测命中 →
@@ -83,6 +93,7 @@ struct caoin_hook {
     u64 el0_pte_addr;           /* EL0 表里本 hook tva 的 PTE（发现后缓存） */
     u64 ret_val;                /* 桩模板：替换返回值（777+i） */
     u64 copy_size;              /* 原函数指令区大小（影子页 scratch 拷贝用，csizeN） */
+    u64 kshadow;                /* 内核分配的影子页（线性地址）；0=用用户态 shva */
 };
 static struct caoin_hook hooks[CAOIN_MAX_HOOKS];
 static int hooks_n;
@@ -99,6 +110,14 @@ static u64 g_verbose;   /* verbose=1 开流程日志；默认静音（无痕优�
 static void *g_copy_process;   /* fork 防护 hook 目标（装不上为 NULL） */
 static u64 g_stub_onload;      /* stub=1：加载即装桩（跳过 INJ_REQ 握手，
                                 * 供 caoin_prep 自动化流程——目标不发请求） */
+/* recstub 的"改参数"规格：arg0=<val> 时 handler 先把 x0 改成该值再跑原函数。
+ * 没给就退化成纯透传（handler 只剩一条 b trampoline）。
+ * 注意这里刻意**不记录参数**：观察型需求走 caoin-hw（KPM 每次命中都能读寄存器，
+ * 零足迹）；影子路线做"改行为"。理由是报告区在受管页内会矛盾——SHADOW 视图下
+ * 该页 EL0 无数据访问，桩的 str 要么 fault、要么（翻到 STEP 后）写进原页污染
+ * 代码段、破坏 CRC 自检。 */
+static u64 g_arg0;
+static int g_has_arg0;
 
 /* 日志双档：CK_ERR 永远打（加载失败必须可见）；CK_LOG 默认静音。
  * ctl0 dump 不受门控（显式查询动作）。 */
@@ -109,6 +128,48 @@ static u64 g_stub_onload;      /* stub=1：加载即装桩（跳过 INJ_REQ 握�
 static unsigned long caoin_va(unsigned long pa)
 {
     return (unsigned long)((pa - (u64)*kvar_memstart_addr) + page_offset_base);
+}
+
+/* 线性地址 → 物理地址（caoin_va 的逆）。内核分配的页要靠它拿 PFN 填进目标 PTE。 */
+static unsigned long caoin_pa(unsigned long va)
+{
+    return (unsigned long)((va - page_offset_base) + (u64)*kvar_memstart_addr);
+}
+
+/* ---- 内核分配影子页（消 maps 足迹）----
+ * 必须在 orig_pte 已推导之后调用：orig_pte 给出原页 PFN，是拷贝源。
+ * 拷贝一律走内核线性地址——绝不碰用户 VA（EL1 读用户 VA 在 SW_TTBR0_PAN 下
+ * 直接 fault，README 有记录）。原页可能是 file-backed，线性映射读即可。 */
+static int caoin_alloc_shadow(struct caoin_hook *h)
+{
+    unsigned long kva, opa, orig_pfn, i;
+
+    if (!h || !kfn_get_free_pages || !kfn_probe_read)
+        return -1;
+    orig_pfn = h->orig_pte & CAOIN_PFN_MASK;
+    if (!orig_pfn) {
+        CK_ERR("caoin-kpm: alloc_shadow: orig_pfn unknown\n");
+        return -1;
+    }
+    kva = kfn_get_free_pages(CAOIN_GFP_KERNEL, 0);
+    if (!kva) {
+        CK_ERR("caoin-kpm: alloc_shadow: __get_free_pages failed\n");
+        return -1;
+    }
+    h->kshadow = kva;
+    opa = caoin_va(orig_pfn);
+    for (i = 0; i < 0x1000; i += 8) {
+        u64 w = 0;
+        if (kfn_probe_read(&w, (void *)(opa + i), 8)) {
+            CK_ERR("caoin-kpm: alloc_shadow: copy fail off=%lx\n", i);
+            return -1;
+        }
+        *(volatile u64 *)(kva + i) = w;
+    }
+    asm volatile("dsb ish" ::: "memory");
+    CK_ERR("caoin-kpm: kshadow=%lx pfn=%lx (copy of orig pfn=%lx)\n",
+           kva, caoin_pa(kva) & CAOIN_PFN_MASK, orig_pfn);
+    return 0;
 }
 
 static void caoin_set_pte(u64 *ptep, u64 val)
@@ -152,12 +213,72 @@ static int caoin_walk_pgd_via_mm(unsigned long va, unsigned long *pte_a_out)
     return caoin_walk_pgd(mm_run_pgd, va, pte_a_out);
 }
 
+/* 影子页的内核线性地址：内核分配直接用；用户态 mmap 则 walk 其 PTE 取 PFN。 */
+static unsigned long caoin_shadow_kva(struct caoin_hook *h)
+{
+    unsigned long pte_a = 0, pte_v = 0;
+
+    if (!h)
+        return 0;
+    if (h->kshadow)
+        return h->kshadow;
+    if (caoin_walk_pgd_via_mm(h->shva, &pte_a)
+        && !kfn_probe_read(&pte_v, (void *)pte_a, 8)
+        && (pte_v & CAOIN_PFN_MASK))
+        return caoin_va(pte_v & CAOIN_PFN_MASK);
+    return 0;
+}
+
 static void status_mark(u64 v);
 static void caoin_install_stub(int hi);
 static void caoin_install_minstore(int hi);
 static void caoin_install_recstub(int hi);
 static int stub_mode = 0;   /* 0=替换桩(777) 1=minstore 2=记录透传(recstub) */
 static void caoin_sync_after_flip(void); /* 保留:占位 */
+
+/* ---- KPM 侧指令重定位器（caoin_reloc.c，从 hook/reloc.c 移植）----
+ * 用来重定位被入口桩覆盖的 4 条序言指令 —— 这是"记录+透传桩"能跑真实函数的
+ * 前提（原版不做重定位，所以 README 说"目标函数须为寄存器运算型"）。 */
+#define CAOIN_OFF_HANDLER  0x800UL
+#define CAOIN_OFF_TRAMP    0x900UL
+#define CAOIN_OFF_REPORT   0xF00UL
+extern unsigned long caoin_reloc_block(u32 *dst, unsigned long dst_addr,
+                                       const u32 *src, unsigned long src_addr,
+                                       int out_status[4]);
+
+/* 入口桩（KPM 版）：adrp x16, <受管页> + add x16, x16, #<handler 页内偏移> + br x16。
+ * 恰好 3 条（≤ 16 字节）。**刻意不用 `LDR X16,#8; BR X16; <handler>`** ——
+ * 那个 literal 在受管页内，而 D 的自指读模拟是从**原页**读的（CRC 场景的正确
+ * 语义：读必须看到原页字节），于是 LDR 拿到的是原页的指令字节 = 垃圾地址 →
+ * BR 飞掉 → SIGSEGV（真机实测）。adrp+add 不读内存，绕开这个语义冲突。 */
+static void caoin_make_entry_stub(u32 *dst, unsigned long handler_off)
+{
+    dst[0] = 0x90000000u | 16;                                    /* adrp x16, page */
+    dst[1] = 0x91000000u | ((u32)(handler_off & 0xFFF) << 10) | (16 << 5) | 16;
+    dst[2] = 0xD61F0200u;                                         /* br x16 */
+}
+
+/* reloc 读 LDR literal 数据用。受管页 VA 内的读走影子页线性地址（影子页是
+ * 原页忠实副本，数据一致）；其余地址用 probe_read 安全读，失败即返回非 0
+ * （reloc 会放弃重定位）——绝不直接解引用用户 VA（EL1 下 PAN 必 fault）。 */
+static unsigned long g_rd_va_base, g_rd_kva_base;
+
+int caoin_kpm_read_va(void *dst, unsigned long va, unsigned long n)
+{
+    unsigned long src = va;
+    unsigned char *d = (unsigned char *)dst;
+    unsigned long i;
+
+    if (g_rd_va_base && va >= g_rd_va_base && va < g_rd_va_base + 0x1000)
+        src = g_rd_kva_base + (va - g_rd_va_base);
+    for (i = 0; i < n; i++) {
+        unsigned char c = 0;
+        if (kfn_probe_read(&c, (void *)(src + i), 1))
+            return -1;
+        d[i] = c;
+    }
+    return 0;
+}
 
 /* ---- EL0 页表 PTE flip（按 hook）----
  * 本机实测 TTBR0 == mm->pgd（无 KPTI 副本），故 EL0 表 PTE == mm->pgd 的
@@ -242,8 +363,8 @@ struct pt_regs_49 {
     u64 pstate;
 };
 
-int caoin_fault_check(unsigned long addr, unsigned long pc,
-                      unsigned int esr, unsigned long *spsr_p);
+int caoin_fault_check(unsigned long addr, struct pt_regs_49 *regs,
+                      unsigned int esr);
 static void caoin_tlb_flush(unsigned long va);
 static void before_page_fault(hook_fargs3_t *args, void *udata);
 static int caoin_is_target_proc(void);
@@ -307,7 +428,7 @@ static void before_page_fault(hook_fargs3_t *args, void *udata)
             inj_armed = 1;
     }
 
-    handled = caoin_fault_check(addr, regs->pc, esr, &regs->pstate);
+    handled = caoin_fault_check(addr, regs, esr);
     if (handled) {
         hit_hi = last_hit_hi;
         if (hit_hi >= 0)
@@ -329,19 +450,26 @@ static void before_page_fault(hook_fargs3_t *args, void *udata)
         }
         return;
     }
-    /* recstub 卡死定位：受管页/影子页取指 fault 现场寄存器 dump（限 4 条） */
+    /* recstub 卡死定位：受管页/影子页取指 fault 现场寄存器 dump（限 4 条）。
+     * 走到这里 = 状态机【未】接管（活锁的 fault 全被 caoin_fault_check 吃掉，
+     * 永远到不了这里），所以这行日志记录的是【另一类】故障。
+     * ec 用来看 EL0/EL1：0x20/0x24=EL0，0x21/0x25=EL1。
+     * view 是当时该 hook 的视图（0=OFF 1=SHADOW 2=STEP），配合 ec 才能判断
+     * "EL1 故障发生时页处于哪个状态"——这是区分 PAN/PTE 异常的唯一线索。 */
     if (regs) {
         static u64 df_n;
-        int hit2 = 0, k2;
+        int hit2 = -1, k2;
         for (k2 = 0; k2 < hooks_n; k2++)
             if ((addr >> 12) == (hooks[k2].shva >> 12)
                 || (addr >> 12) == (hooks[k2].tva >> 12)
                 || (regs->pc >> 12) == (hooks[k2].shva >> 12))
-                { hit2 = 1; break; }
-        if (hit2 && df_n < 4) {
-            CK_ERR("caoin-kpm: DUMP pc=%lx far=%lx esr=%x x0=%lx x16=%lx x19=%lx\n",
-                   regs->pc, addr, esr, regs->regs[0], regs->regs[16],
-                   regs->regs[19]);
+                { hit2 = k2; break; }
+        if (hit2 >= 0 && df_n < 4) {
+            CK_ERR("caoin-kpm: DUMP pc=%lx far=%lx esr=%x ec=%x view=%d "
+                   "x0=%lx x16=%lx x19=%lx\n",
+                   regs->pc, addr, esr, (unsigned)(esr >> 26),
+                   (int)hooks[hit2].cur_view,
+                   regs->regs[0], regs->regs[16], regs->regs[19]);
             df_n++;
         }
     }
@@ -375,12 +503,162 @@ int caoin_fault_hook_idx(void)
     return last_hit_hi;
 }
 
-int caoin_fault_check(unsigned long addr, unsigned long pc,
-                      unsigned int esr, unsigned long *spsr_p)
+/* ---- 方案 D：自指数据访问的软件模拟 ----
+ * 实测（tests/selfread.c，2026-10-15 MI 8 Pro）：SHADOW 视图下若【取指所在页
+ * == 受管页】，翻转会形成 SHADOW/STEP 无限振荡——dmesg 实测 ec=24 与 ec=20
+ * 严格 35/35 交替、全部 fault 的 pc 与 far 同落受管页、进程 ~82% stime 烧满。
+ * 根因：翻转后 eret 要重取指，而重取指被 STEP 的 UXN 挡住，两个状态互斥。
+ *
+ * 这里不翻转：在 handler 里代读原页、把值写进目标寄存器、pc += 4 跳过该指令。
+ * 指令被跳过而不是重试 → 不需要重取指 → 振荡的另一支被拆掉。PTE 全程不动，
+ * 于是【受管页不必独占】（页内可以有字面量池/跳转表这类自指读）。
+ *
+ * 只处理整数 load（含后/前变址写回，实测 selfread 用的是
+ * `ldr x1, [x2], #8` 后变址）。store / SIMD / 缓存维护等返回 0，
+ * 回退到原翻转路径——语义不变、不崩（可能活锁，用 selfread_fb 计数暴露）。 */
+static int caoin_emulate_selfread(struct caoin_hook *h, struct pt_regs_49 *regs,
+                                  unsigned long far)
+{
+    u32 insn;
+    unsigned long sh_pfn, or_pfn, kva_sh, kva_or, eff;
+    int size, v, opc, rt, rn, mode = -1, is_signed = 0;
+    long imm = 0;
+    u64 val = 0;
+
+    if (!h || !regs || !kfn_probe_read)
+        return 0;
+    if ((far >> 12) != (h->tva >> 12))
+        return 0;                 /* 数据地址不在受管页：不该走到这里 */
+
+    sh_pfn = h->shadow_pte_val & CAOIN_PFN_MASK;
+    or_pfn = h->orig_pte & CAOIN_PFN_MASK;
+    if (!sh_pfn || !or_pfn)
+        return 0;
+    kva_sh = caoin_va(sh_pfn);
+    kva_or = caoin_va(or_pfn);
+
+    /* 取指令：从【影子页】线性地址读——CPU 实际执行的就是影子页的字节。
+     * 绝不能用用户 VA 读：EL1 下 SW_TTBR0_PAN 会直接 fault（README 有记录）。 */
+    if (kfn_probe_read(&insn, (void *)(kva_sh + (regs->pc & 0xFFF)), 4))
+        return 0;
+
+    /* ---- LDR (literal)：opc(2) 011 V(1) 00 imm19(19) Rt(5) ----
+     * 入口桩的 `LDR X16, #8`（0x58000050）就是这条 —— 它要读的 handler 地址
+     * 就在入口桩 +8，**同页 → 自指读**。原来的解码器只认"立即数寻址"那一族
+     * （bits 29:27 = 111），这条落回翻转 → 真机实测活锁（ec=24/ec=20 在入口桩上
+     * 交替：pc=入口桩、far=入口桩+8）。这一族必须单独处理。 */
+    if ((insn & 0x3B000000) == 0x18000000) {
+        int lopc = (int)((insn >> 30) & 3);
+        int lv   = (int)((insn >> 26) & 1);
+        int lrt  = (int)(insn & 0x1F);
+
+        if (lv)
+            return 0;                 /* SIMD/FP literal，不处理 */
+        if (lopc == 3)
+            return 1;                 /* PRFM：无副作用，直接跳过 */
+
+        eff = far & 0xFFF;            /* far 已由硬件算好 = pc + (imm19<<2) */
+        if (lopc == 0) {              /* LDR Wt：读 4，零扩展 */
+            unsigned int v32 = 0;
+            if (kfn_probe_read(&v32, (void *)(kva_or + eff), 4))
+                return 0;
+            val = (u64)v32;
+        } else if (lopc == 1) {       /* LDR Xt：读 8 */
+            if (kfn_probe_read(&val, (void *)(kva_or + eff), 8))
+                return 0;
+        } else {                      /* LDRSW：读 4，符号扩展到 64 */
+            unsigned int v32 = 0;
+            if (kfn_probe_read(&v32, (void *)(kva_or + eff), 4))
+                return 0;
+            val = (u64)(s64)(int)v32;
+        }
+        if (lrt != 31)
+            regs->regs[lrt] = val;
+        regs->pc += 4;
+        return 1;
+    }
+
+    /* 只认整数 load/store 立即数类：bits 29:27 = 111 且 V(bit26) = 0 */
+    if ((insn & 0x38000000) != 0x38000000)
+        return 0;
+    v = (insn >> 26) & 1;
+    if (v)
+        return 0;                 /* SIMD/FP，不处理 */
+    size = (insn >> 30) & 3;
+    opc  = (insn >> 22) & 3;
+    if (opc == 0)
+        return 0;                 /* STR：模拟 store 会让"读的人"和"执行的人"分叉，回退 */
+
+    switch ((insn >> 24) & 3) {
+    case 1:                       /* 无符号偏移：size 111 V 01 opc imm12 Rn Rt */
+        mode = 0;
+        imm  = (long)((insn >> 10) & 0xFFF) << size;
+        break;
+    case 0: {                     /* 未缩放/后变址/前变址：op2 = bits 11:10 */
+        int op2 = (insn >> 10) & 3;
+        if (op2 == 2)
+            return 0;             /* 非特权 LDTR/STTR，不处理 */
+        imm = (long)((insn >> 12) & 0x1FF);
+        if (imm & 0x100)
+            imm -= 0x200;         /* 符号扩展 imm9 */
+        mode = (op2 == 0) ? 1 : (op2 == 1 ? 2 : 3);
+        break;
+    }
+    default:
+        return 0;
+    }
+    if (mode < 0)
+        return 0;
+
+    rn = (insn >> 5) & 0x1F;
+    rt = insn & 0x1F;
+    if (opc >= 2)
+        is_signed = 1;
+
+    /* 代读原页（走内核线性地址，绕过受管页的 EL0 权限） */
+    eff = far & 0xFFF;
+    if (size == 3) {
+        if (kfn_probe_read(&val, (void *)(kva_or + eff), 8))
+            return 0;
+    } else if (size == 2) {
+        unsigned int v32 = 0;
+        if (kfn_probe_read(&v32, (void *)(kva_or + eff), 4))
+            return 0;
+        val = is_signed ? (u64)(s64)(int)v32 : (u64)v32;
+    } else if (size == 1) {
+        unsigned short v16 = 0;
+        if (kfn_probe_read(&v16, (void *)(kva_or + eff), 2))
+            return 0;
+        val = is_signed ? (u64)(s64)(short)v16 : (u64)v16;
+    } else {
+        unsigned char v8 = 0;
+        if (kfn_probe_read(&v8, (void *)(kva_or + eff), 1))
+            return 0;
+        val = is_signed ? (u64)(s64)(signed char)v8 : (u64)v8;
+    }
+
+    /* 变址写回：后变址时 far = 旧 Rn → Rn = far + imm；
+     * 前变址时 far 已含 imm → Rn = far。Rn=31 是 SP，本路径不处理。 */
+    if (rn != 31) {
+        if (mode == 2)
+            regs->regs[rn] = (u64)far + (u64)imm;
+        else if (mode == 3)
+            regs->regs[rn] = (u64)far;
+    }
+
+    if (rt != 31)                 /* Rt=31 是 XZR，写入丢弃 */
+        regs->regs[rt] = val;
+
+    regs->pc += 4;                /* 跳过这条指令：不重取指 → 无振荡 */
+    return 1;
+}
+
+int caoin_fault_check(unsigned long addr, struct pt_regs_49 *regs,
+                      unsigned int esr)
 {
     unsigned int ec = esr >> 26;
+    unsigned long pc = regs ? regs->pc : 0;
     int i;
-    (void)spsr_p;
 
     /* 取证：受管页/哨兵页 fault 限速记录。SENT 标记区分哨兵页；
      * 前 30 条无条件记录是系统杂散噪声 */
@@ -411,10 +689,22 @@ int caoin_fault_check(unsigned long addr, unsigned long pc,
 
         /* SHADOW 视图：EL0 数据 fault → 切 STEP（orig 页 RW+UXN）。
          * 不能检查 WnR——DC CIVAC 等 cache 维护指令 fault 时 WnR=1，
-         * 放行会让它落进原生路径卡死。STEP 下 eret 重试必成。 */
+         * 放行会让它落进原生路径卡死。STEP 下 eret 重试必成。
+         *
+         * 方案 D：若【取指也在受管页内】（自指访问），翻转必然造成
+         * SHADOW/STEP 无限振荡（tests/selfread.c 实测 ec=24/ec=20 严格交替）
+         * → 改为软件模拟这次读，PTE 保持 SHADOW 不动。形态不认识时回退翻转。 */
         if (h->cur_view == VIEW_SHADOW) {
             if (ec != 0x24)
                 return 0;   /* 非数据 fault：放行 */
+            if (regs && (regs->pc >> 12) == (h->tva >> 12)) {
+                if (caoin_emulate_selfread(h, regs, addr)) {
+                    selfread_ok_cnt++;
+                    last_hit_hi = i;
+                    return 1;   /* 已代读 + pc+=4，视图保持 SHADOW */
+                }
+                selfread_fb_cnt++;   /* 未识别形态：回退翻转（可能活锁） */
+            }
             caoin_flip_hook(i, VIEW_STEP);
             h->cur_view = VIEW_STEP;
             caoin_tlb_flush(h->tva);
@@ -506,8 +796,11 @@ static int caoin_locate(unsigned long task, unsigned long va, unsigned long expe
                 continue;
             if (pgd_p < page_offset_base || (pgd_p & 0xFFF))
                 continue;
+            /* va2 是"第二个数据点"，用来交叉确认 mm/pgd 偏移。内核分配 status 页
+             * 时没有用户 VA 可 walk（va2=0），跳过这层校验——主证据仍是 va 那次
+             * walk（它本身就要求 tva 能经候选 mm/pgd 走到 PTE）。 */
             if (caoin_probe_walk(mm_c, poff, va, expect_phys, pte_a_out)
-                && caoin_probe_walk(mm_c, poff, va2, expect2, 0)) {
+                && (!va2 || caoin_probe_walk(mm_c, poff, va2, expect2, 0))) {
                 *mm_off_out = moff;
                 *pgd_off_out = poff;
                 if (mm_out)
@@ -522,6 +815,28 @@ static int caoin_locate(unsigned long task, unsigned long va, unsigned long expe
 static void caoin_write_status(unsigned long va, u64 val)
 {
     unsigned long pte_a = 0, pte_v, phys, before = 0, after = 0;
+
+    /* 内核分配的 status 页：没有用户 VA 可 walk，直接走线性地址。
+     * cfg_e2 在 init 里早于本函数第一次调用就已定好（见 init 的 kstatus 分支）。 */
+    if (!va) {
+        u64 *kslot;
+        if (!cfg_e2)
+            return;
+        kslot = (u64 *)caoin_va(cfg_e2 & CAOIN_PFN_MASK);
+        if (kfn_probe_read(&before, (void *)kslot, 8))
+            { CK_ERR("caoin-kpm: wstat kslot unreadable %p\n", kslot); return; }
+        if (!kfn_probe_write || kfn_probe_write(kslot, &val, 8) != 0)
+            { CK_ERR("caoin-kpm: wstat kslot write fail %p\n", kslot); return; }
+        asm volatile("dc civac, %0" :: "r"(kslot) : "memory");
+        kfn_probe_read(&after, (void *)kslot, 8);
+        CK_LOG("caoin-kpm: wstat kslot=%llx %llx->%llx (want %llx)\n",
+               (unsigned long long)(unsigned long)kslot,
+               (unsigned long long)before, (unsigned long long)after,
+               (unsigned long long)val);
+        asm volatile("dsb ish" ::: "memory");
+        return;
+    }
+
     if (!caoin_probe_walk(mm_run, pgd_off, va, 0, &pte_a))
         { CK_LOG("caoin-kpm: wstat walk fail va=%lx\n", va); return; }
     if (kfn_probe_read(&pte_v, (void *)pte_a, 8))
@@ -580,6 +895,8 @@ static void parse_args(const char *args)
         else if (!strncmp(p, "csize3=", 7)) hooks[3].copy_size = parse_hex(p + 7);
         else if (!strncmp(p, "verbose=", 8)) g_verbose = parse_hex(p + 8);
         else if (!strncmp(p, "stub=", 5)) g_stub_onload = parse_hex(p + 5);
+        else if (!strncmp(p, "stubmode=", 9)) stub_mode = (int)parse_hex(p + 9);
+        else if (!strncmp(p, "arg0=", 5)) { g_arg0 = parse_hex(p + 5); g_has_arg0 = 1; }
         else if (!strncmp(p, "tva=", 4)) hooks[0].tva = parse_hex(p + 4);
         else if (!strncmp(p, "shva=", 5)) hooks[0].shva = parse_hex(p + 5);
         else if (!strncmp(p, "tva1=", 5)) hooks[1].tva = parse_hex(p + 5);
@@ -725,6 +1042,36 @@ static long caoin_restore(void)
     if (g_copy_process)
         caoin_unhook(g_copy_process, before_copy_process, after_copy_process);
     caoin_write_status(cfg_sva, 0xF);
+
+    /* 内核分配的页只能在"确认没有目标 PTE 再指向它"之后释放。
+     * 判据：所有 hook 的 cur_view 都回到 VIEW_OFF —— 要么本函数刚恢复过，
+     * 要么 exit_mmap 钩子在目标死亡时恢复过，要么从未 arm。
+     * 任何一条不满足（例如目标还活着但恢复被跳过）就宁可泄漏这两页，
+     * 也不能把目标 PTE 指向的页还给分配器（UAF → 随机内核写）。 */
+    {
+        int safe = 1;
+        for (i = 0; i < hooks_n; i++)
+            if (hooks[i].cur_view != VIEW_OFF)
+                safe = 0;
+        if (!safe) {
+            CK_ERR("caoin-kpm: PTE state not OFF -> kernel pages leaked (avoid UAF)\n");
+        } else if (kfn_free_pages) {
+            int nf = 0;
+            for (i = 0; i < hooks_n; i++)
+                if (hooks[i].kshadow) {
+                    kfn_free_pages(hooks[i].kshadow, 0);
+                    hooks[i].kshadow = 0;
+                    nf++;
+                }
+            if (kstatus) {
+                kfn_free_pages(kstatus, 0);
+                kstatus = 0;
+                nf++;
+            }
+            /* 打出实际条数：旧路径（用户态 mmap）这里是 0，不是"释放了" */
+            CK_ERR("caoin-kpm: kernel pages freed = %d\n", nf);
+        }
+    }
     CK_LOG("caoin-kpm: off, restored (%d hooks)\n", hooks_n);
     return 0;
 }
@@ -738,14 +1085,14 @@ static long caoin_restore(void)
 static void caoin_install_stub(int hi)
 {
     struct caoin_hook *h = &hooks[hi];
-    unsigned long pte_a = 0, pte_v = 0, kva;
+    unsigned long kva;
     volatile u32 *stub;
     u32 enc;
 
-    if (caoin_walk_pgd_via_mm(h->shva, &pte_a)
-        && !kfn_probe_read(&pte_v, (void *)pte_a, 8)
-        && (pte_v & CAOIN_PFN_MASK)) {
-        kva = caoin_va(pte_v & CAOIN_PFN_MASK) + h->shva_off;
+    /* caoin_shadow_kva 同时覆盖"用户态 mmap 的影子页"和"内核分配的影子页" */
+    kva = caoin_shadow_kva(h);
+    if (kva) {
+        kva += h->shva_off;
         enc = 0x52800000u | ((u32)(h->ret_val & 0xFFFF) << 5);
         stub = (volatile u32 *)kva;
         stub[0] = enc;                       /* movz w0, #ret_val */
@@ -760,10 +1107,12 @@ static void caoin_install_stub(int hi)
             asm volatile("isb" ::: "memory");
         }
         status_mark(0xCA0FCA03ULL);
-        CK_ERR("caoin-kpm: hook%d stub installed shva=%lx off=%lx val=%d\n",
-               hi, h->shva, h->shva_off, (int)(h->ret_val & 0xFFFF));
+        CK_ERR("caoin-kpm: hook%d stub installed %s=%lx off=%lx val=%d\n",
+               hi, h->kshadow ? "kshadow" : "shva",
+               h->kshadow ? h->kshadow : h->shva, h->shva_off,
+               (int)(h->ret_val & 0xFFFF));
     } else {
-        CK_ERR("caoin-kpm: hook%d shva walk fail\n", hi);
+        CK_ERR("caoin-kpm: hook%d shadow kva unresolvable\n", hi);
     }
 }
 
@@ -827,61 +1176,99 @@ static void caoin_install_minstore(int hi)
 static void caoin_install_recstub(int hi)
 {
     struct caoin_hook *h = &hooks[hi];
-    unsigned long tpte_a = 0, tpte_v = 0, spte_a = 0, spte_v = 0;
-    unsigned long tl, sl, off = h->shva_off;
-    u64 report = h->shva + 0xF00;
-    u32 enc[16];
-    int n = 0;
-    unsigned long o2, i2;
+    unsigned long skva, okva, orig_pfn, off, page_va, n;
+    u32 orig[4];
+    int st[4], i;
+    u32 *dst;
 
-    if (!caoin_walk_pgd_via_mm(h->tva, &tpte_a)
-        || kfn_probe_read(&tpte_v, (void *)tpte_a, 8)
-        || !(tpte_v & CAOIN_PFN_MASK))
-        { CK_ERR("caoin-kpm: hook%d tva walk fail\n", hi); return; }
-    if (!caoin_walk_pgd_via_mm(h->shva, &spte_a)
-        || kfn_probe_read(&spte_v, (void *)spte_a, 8)
-        || !(spte_v & CAOIN_PFN_MASK))
-        { CK_ERR("caoin-kpm: hook%d shva walk fail\n", hi); return; }
-    tl = caoin_va(tpte_v & CAOIN_PFN_MASK);
-    sl = caoin_va(spte_v & CAOIN_PFN_MASK);
+    skva = caoin_shadow_kva(h);
+    if (!skva) {
+        CK_ERR("caoin-kpm: hook%d recstub: shadow kva unresolvable\n", hi);
+        return;
+    }
+    orig_pfn = h->orig_pte & CAOIN_PFN_MASK;
+    if (!orig_pfn) {
+        CK_ERR("caoin-kpm: hook%d recstub: orig pfn unknown\n", hi);
+        return;
+    }
+    okva = caoin_va(orig_pfn);
+    off = h->shva_off;
+    /* 影子页占的是**受管页的 VA**（PTE 只换 PFN）→ 所有 VA 编码量一律用受管页基准。
+     * 这同时解决了内核分配影子页时"目标怎么读报告区"的问题：目标照常读
+     * 受管页 VA + 0xF00 就行，不需要任何额外映射。
+     * 注意 caoin 的命名：CAOIN_PAGE_MASK 就是 ~0xFFF（"保留页基址"），
+     * 所以取基址是 & CAOIN_PAGE_MASK，取偏移才是 & ~CAOIN_PAGE_MASK。 */
+    page_va = h->tva & CAOIN_PAGE_MASK;
 
-    /* 原函数指令 → 影子页 scratch（+0x800） */
-    for (i2 = 0; i2 < h->copy_size; i2 += 4) {
-        u64 insn = 0;
-        if (!kfn_probe_read(&insn, (void *)(tl + off + i2), 4))
-            *(u32 *)(sl + 0x800 + i2) = (u32)insn;
+    /* 读被覆盖的 4 条原指令：从原页线性地址读，绝不碰用户 VA */
+    for (i = 0; i < 4; i++) {
+        u32 w = 0;
+        if (kfn_probe_read(&w, (void *)(okva + off + (unsigned long)i * 4), 4)) {
+            CK_ERR("caoin-kpm: hook%d recstub: read prologue fail off=%lx\n",
+                   hi, off + (unsigned long)i * 4);
+            return;
+        }
+        orig[i] = w;
     }
 
-    /* 序言：x16 = 报告地址（4 条 movz/movk），x0..x3 入报告区，b scratch */
-    enc[n++] = 0xD2800000u | ((u32)((report >> 0)  & 0xFFFF) << 5) | 16;
-    enc[n++] = 0xF2A00000u | ((u32)((report >> 16) & 0xFFFF) << 5) | 16;
-    enc[n++] = 0xF2C00000u | ((u32)((report >> 32) & 0xFFFF) << 5) | 16;
-    enc[n++] = 0xF2E00000u | ((u32)((report >> 48) & 0xFFFF) << 5) | 16;
-    enc[n++] = 0xF9000200u;   /* str x0, [x16] */
-    enc[n++] = 0xF9000401u;   /* str x1, [x16, #8] */
-    enc[n++] = 0xF9000802u;   /* str x2, [x16, #16] */
-    enc[n++] = 0xF9000C03u;   /* str x3, [x16, #24] */
-    /* magic 探针:x17=0xCA0FCA11 -> [x16,#0x40] —— 区分"报告区不可见"与"写 0" */
-    enc[n++] = 0xD2994231u;   /* movz x17, #0xCA11 */
-    enc[n++] = 0xF2B941F1u;   /* movk x17, #0xCA0F, lsl #16 */
-    enc[n++] = 0xF9000A11u;   /* str x17, [x16, #0x40] */
+    /* 1) 先重定位被覆盖的 4 条原指令。
+     * 必须排在"写入口桩"之前：重定位失败时影子页还是原页的忠实副本，
+     * 什么都没装 → 安全。反过来（先写桩再重定位）会在失败时留下半装的桩，
+     * handler 里的 `b trampoline` 跳进没写过的区域 → 目标 SIGSEGV（实测）。 */
+    g_rd_va_base = page_va;
+    g_rd_kva_base = skva;
+    n = caoin_reloc_block((u32 *)(skva + CAOIN_OFF_TRAMP),
+                          page_va + CAOIN_OFF_TRAMP, orig, h->tva, st);
+    g_rd_va_base = 0;
+    g_rd_kva_base = 0;
+    if (!n) {
+        CK_ERR("caoin-kpm: hook%d recstub: reloc fail st=%d,%d,%d,%d "
+               "orig=%08x,%08x,%08x,%08x tva=%lx page=%lx tramp=%lx\n",
+               hi, st[0], st[1], st[2], st[3],
+               orig[0], orig[1], orig[2], orig[3],
+               h->tva, page_va, page_va + CAOIN_OFF_TRAMP);
+        return;
+    }
+
+    /* 2) 入口桩（3 条，adrp+add+br，不读内存） */
+    caoin_make_entry_stub((u32 *)(skva + off), CAOIN_OFF_HANDLER);
+
+    /* 3) handler：可选地把 x0 改成 arg0，然后跳 trampoline。
+     * 刻意不写任何内存（报告区方案已弃用，理由见 g_arg0 的注释）。 */
+    dst = (u32 *)(skva + CAOIN_OFF_HANDLER);
     {
-        long delta = (long)(((0x800 - off) >> 2) & 0x03FFFFFF);
-        enc[n++] = 0x14000000u | (u32)delta;   /* b scratch */
-    }
-    for (o2 = 0; o2 < (unsigned long)n; o2++)
-        *(volatile u32 *)(sl + off + o2 * 4) = enc[o2];
+        unsigned long tramp = page_va + CAOIN_OFF_TRAMP;
+        unsigned long hva   = page_va + CAOIN_OFF_HANDLER;
+        long d;
+        int nh = 0;
 
-    /* cache 维护：桩区 + scratch 区（线性地址，I-cache PIPT 等效） */
-    for (o2 = 0; o2 < 0x1000; o2 += 64) {
-        asm volatile("dc cvau, %0" :: "r"(sl + o2));
-        asm volatile("ic ivau, %0" :: "r"(sl + o2));
+        if (g_has_arg0) {
+            u64 v = g_arg0;
+            dst[nh++] = 0xD2800000u | ((u32)((v >>  0) & 0xFFFF) << 5) | 0; /* movz x0 */
+            dst[nh++] = 0xF2A00000u | ((u32)((v >> 16) & 0xFFFF) << 5) | 0; /* movk lsl16 */
+            dst[nh++] = 0xF2C00000u | ((u32)((v >> 32) & 0xFFFF) << 5) | 0; /* movk lsl32 */
+            dst[nh++] = 0xF2E00000u | ((u32)((v >> 48) & 0xFFFF) << 5) | 0; /* movk lsl48 */
+        }
+        d = (long)((tramp - (hva + (unsigned long)nh * 4)) >> 2);
+        dst[nh++] = 0x14000000u | ((u32)d & 0x03FFFFFFu);                  /* b trampoline */
     }
-    asm volatile("dsb ish" ::: "memory");
-    asm volatile("isb" ::: "memory");
+
+    /* 4) cache 维护（线性地址，I-cache PIPT 等效） */
+    {
+        unsigned long o2;
+        for (o2 = 0; o2 < 0x1000; o2 += 64) {
+            asm volatile("dc cvau, %0" :: "r"(skva + o2));
+            asm volatile("ic ivau, %0" :: "r"(skva + o2));
+        }
+        asm volatile("dsb ish" ::: "memory");
+        asm volatile("isb" ::: "memory");
+    }
     status_mark(0xCA0FCA03ULL);
-    CK_ERR("caoin-kpm: hook%d recstub installed shva=%lx off=%lx scratch=800 report=f00 csize=%lx\n",
-           hi, h->shva, off, h->copy_size);
+    CK_ERR("caoin-kpm: hook%d recstub installed page=%lx off=%lx handler=%lx "
+           "tramp=%lx(%lu insns) arg0=%s%lx\n",
+           hi, page_va, off, page_va + CAOIN_OFF_HANDLER,
+           page_va + CAOIN_OFF_TRAMP, n,
+           g_has_arg0 ? "0x" : "(none)", (unsigned long)g_arg0);
 }
 
 /* status 打标（经 status 页物理帧线性地址；帧 PFN=cfg_e2，init 自推导） */
@@ -909,13 +1296,14 @@ static long caoin_init(const char *args, const char *event, void *__user reserve
         return -1;
     }
     parse_args(args);
-    /* hook 数量统计（tva 非零即有效） */
+    /* hook 数量统计（tva 非零即有效）。shva 可省 → 内核分配影子页；
+     * sva 可省 → 内核分配 status 页。两者都省 = 目标 maps 零新增 VMA。 */
     hooks_n = 0;
     for (i = 0; i < CAOIN_MAX_HOOKS; i++)
-        if (hooks[i].tva && hooks[i].shva)
+        if (hooks[i].tva)
             hooks_n = i + 1;
-    if (!cfg_pid || !cfg_sva || !hooks_n) {
-        CK_ERR("caoin-kpm: missing args (pid/sva + tva/shva per hook)\n");
+    if (!cfg_pid || !hooks_n) {
+        CK_ERR("caoin-kpm: missing args (need pid + tvaN; sva/shva optional)\n");
         return -1;
     }
     /* shva_off：受管函数页内偏移。自动 = tva & 0xFFF——实战目标函数通常不在
@@ -945,6 +1333,8 @@ static long caoin_init(const char *args, const char *event, void *__user reserve
     kfn_probe_read = (void *)kallsyms_lookup_name("probe_kernel_read");
     kfn_probe_write = (void *)kallsyms_lookup_name("probe_kernel_write");
     kfn_find_task_by_vpid = (void *)kallsyms_lookup_name("find_task_by_vpid");
+    kfn_get_free_pages = (void *)kallsyms_lookup_name("__get_free_pages");
+    kfn_free_pages = (void *)kallsyms_lookup_name("free_pages");
     if (!kvar_memstart_addr || !kfn_probe_read || !kfn_find_task_by_vpid) {
         CK_ERR("caoin-kpm: symbol resolve failed (memstart=%lx probe=%lx find=%lx)\n",
                (unsigned long)kvar_memstart_addr,
@@ -954,6 +1344,24 @@ static long caoin_init(const char *args, const char *event, void *__user reserve
     }
     CK_LOG("caoin-kpm: memstart=%llx hooks=%d args ok\n",
            (unsigned long long)(s64)*kvar_memstart_addr, hooks_n);
+
+    /* status 页下沉：没有用户态 sva 就在内核分配。
+     * 必须在第一次 caoin_write_status 之前把 cfg_e2 定好——否则 cfg_sva=0 时
+     * caoin_write_status 会去 walk VA=0 的 PTE，那是完全错误的目标地址。 */
+    if (!cfg_sva) {
+        if (!kfn_get_free_pages) {
+            CK_ERR("caoin-kpm: no sva provided and __get_free_pages unavailable\n");
+            return -1;
+        }
+        kstatus = kfn_get_free_pages(CAOIN_GFP_KERNEL, 0);
+        if (!kstatus) {
+            CK_ERR("caoin-kpm: kstatus alloc failed\n");
+            return -1;
+        }
+        cfg_e2 = caoin_pa(kstatus) & CAOIN_PFN_MASK;
+        CK_ERR("caoin-kpm: kstatus=%lx pfn=%lx (kernel-allocated, no VMA)\n",
+               (unsigned long)kstatus, (unsigned long)cfg_e2);
+    }
 
     task = kfn_find_task_by_vpid((int)cfg_pid);
     if (!task) {
@@ -999,10 +1407,16 @@ static long caoin_init(const char *args, const char *event, void *__user reserve
             return -1;
         h->orig_pte = orig_v;
 
-        /* sphys 自推导（pagemap PFN 被 CAP_SYS_ADMIN 剥离的备胎） */
-        if (caoin_probe_walk(mmv, pgd_off_out, h->shva, 0, &spte)
-            && !kfn_probe_read(&spv, (void *)spte, 8))
-            h->shadow_pte_val = spv & CAOIN_PFN_MASK;   /* 暂存 PFN */
+        /* 影子页 PFN：
+         *  - 给了 shva：用户态 mmap 的影子页，walk 其 PTE 取 PFN（旧路径）
+         *  - 没给 shva：内核分配一页 + 从原页拷 4K（新路径，maps 不留 VMA） */
+        if (h->shva) {
+            if (caoin_probe_walk(mmv, pgd_off_out, h->shva, 0, &spte)
+                && !kfn_probe_read(&spv, (void *)spte, 8))
+                h->shadow_pte_val = spv & CAOIN_PFN_MASK;   /* 暂存 PFN */
+        } else if (caoin_alloc_shadow(h) == 0) {
+            h->shadow_pte_val = caoin_pa(h->kshadow) & CAOIN_PFN_MASK;
+        }
         if (!h->shadow_pte_val || !orig_v) {
             CK_ERR("caoin-kpm: hook%d derive fail\n", i);
             return -1;
@@ -1015,8 +1429,9 @@ static long caoin_init(const char *args, const char *event, void *__user reserve
         h->origview_pte_val = (orig_v & ~(PTE_AP_MASK | PTE_UXN))
                             | 0x40UL | PTE_UXN;
         h->ret_val = 777 + i;   /* 桩模板：777/778/779…（区分 hook 点） */
-        CK_LOG("caoin-kpm: hook%d tva=%lx shva=%lx pte=%lx ret=%d\n",
-               i, h->tva, h->shva, h->pte_addr, (int)(h->ret_val & 0xFFFF));
+        CK_LOG("caoin-kpm: hook%d tva=%lx shva=%lx kshadow=%lx pte=%lx ret=%d\n",
+               i, h->tva, h->shva, h->kshadow, h->pte_addr,
+               (int)(h->ret_val & 0xFFFF));
     }
 
     /* KPTI 副本兜底扫描：只对 hook0 做一次性扫描（本机 TTBR0==mm->pgd 无副本；
@@ -1142,9 +1557,18 @@ static long caoin_init(const char *args, const char *event, void *__user reserve
      * 目标不发注入请求，工具已备好影子页（原页快照）与 status 页。
      * 桩经目标 mm 的页表 walk 写入 shadow 页，不需要目标 fault 上下文。 */
     if (g_stub_onload) {
-        for (i = 0; i < hooks_n; i++)
-            caoin_install_stub(i);
-        CK_LOG("caoin-kpm: stub=1 → %d stubs installed at load\n", hooks_n);
+        for (i = 0; i < hooks_n; i++) {
+            /* 尊重 stub_mode：原来这里无条件装 777 桩，导致 stubmode=2（recstub）
+             * 在 stub=1 路径下根本测不到。 */
+            if (stub_mode == 0)
+                caoin_install_stub(i);
+            else if (stub_mode == 1)
+                caoin_install_minstore(i);
+            else
+                caoin_install_recstub(i);
+        }
+        CK_LOG("caoin-kpm: stub=1 → %d stubs installed at load (mode=%d)\n",
+               hooks_n, stub_mode);
     }
     CK_LOG("caoin-kpm: on (%d hooks, dpf hooked, seesaw armed)\n", hooks_n);
     return 0;
@@ -1167,8 +1591,10 @@ static long caoin_ctl0(const char *args, char *__user out_msg, int outlen)
                 hooks[i].cur_view == VIEW_STEP ? "stepping" : "orig",
                 hooks[i].pte_addr,
                 (unsigned long long)ec20_cnt, (unsigned long long)ec24_cnt);
-    pr_info("caoin-kpm: sent=%llu el0tab=%lx\n",
-            (unsigned long long)sent_cnt, el0_table_base);
+    pr_info("caoin-kpm: sent=%llu el0tab=%lx selfread_ok=%llu selfread_fb=%llu\n",
+            (unsigned long long)sent_cnt, el0_table_base,
+            (unsigned long long)selfread_ok_cnt,
+            (unsigned long long)selfread_fb_cnt);
     return 0;
 }
 

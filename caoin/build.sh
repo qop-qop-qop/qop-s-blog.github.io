@@ -18,6 +18,14 @@ $CC -Wall -O2 -nostdlib -pie tests/shellwatch.c -o build/shellwatch \
     -Wl,--dynamic-linker=/system/bin/linker64 \
     -Wl,--allow-shlib-undefined -Wl,--export-dynamic \
     -Lbuild -l:libc_bionic.so
+# selfread：实验 A 目标（自指数据读 → 验证独占页约束的真实边界）
+# -fno-toplevel-reorder 是硬要求：-O2 默认开 -ftoplevel-reorder，会把顶层 asm 的
+# 三个 .fill 全挪到函数之前（实测函数被挤到 section offset 0x1000），导致函数所在页
+# 紧邻 .rodata（out_str 的字符串常量），受管页混进被读数据 → 污染"自指读"这个自变量。
+$CC -Wall -O2 -fno-toplevel-reorder -nostdlib -pie tests/selfread.c -o build/selfread \
+    -Wl,--dynamic-linker=/system/bin/linker64 \
+    -Wl,--allow-shlib-undefined -Wl,--export-dynamic \
+    -Lbuild -l:libc_bionic.so
 $CC -Wall -O2 -static tests/target_dummy.c -o build/target_dummy
 $CC -Wall -O2 -shared -fPIC -nostdlib agent/agent_dummy.c -o build/agent_dummy.so
 

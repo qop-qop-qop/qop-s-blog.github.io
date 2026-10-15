@@ -1,3 +1,4 @@
 add_kpm_module(caoin-shadow
     caoin_kpm.c
+    caoin_reloc.c
 )
