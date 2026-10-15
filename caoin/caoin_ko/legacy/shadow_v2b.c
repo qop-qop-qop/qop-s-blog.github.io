@@ -49,6 +49,7 @@ struct caoin_cfg {
     u64 t_mod;         /* mod_timer 地址 */
     u64 t_del;         /* del_timer_sync 地址 */
     u64 jiffies_addr;  /* jiffies 变量地址 */
+    u64 on_each_cpu;   /* on_each_cpu 地址（全核切 VBAR 用；0 = 只切当前核） */
     u64 unused[1];
     /* 运行态 */
     u64 orig_pte;
@@ -77,8 +78,10 @@ static int (*caoin_printk)(const char *fmt, ...);
 static void caoin_tlb_flush(unsigned long va)
 {
     unsigned long addr = va >> 12;
+    /* vaae1is：VA + 所有 ASID——本模块运行在 insmod 的 ASID 上下文，
+       vae1is 只刷当前 ASID，对目标进程 TLB 无效 */
     asm volatile("dsb ish" ::: "memory");
-    asm volatile("tlbi vae1is, %0" :: "r"(addr));
+    asm volatile("tlbi vaae1is, %0" :: "r"(addr));
     asm volatile("isb" ::: "memory");
 }
 
@@ -230,6 +233,15 @@ int caoin_fault_check(unsigned long addr, unsigned long pc,
     unsigned int ec = esr >> 26;
     unsigned int iss = esr & 0x1FFFFFF;
     u64 mdscr;
+
+    /* 取证：前 30 次调用全记录（livelock 悬案） */
+    {
+        static u64 flt_n;
+        if (flt_n < 30)
+            CK_LOG("caoin2b: flt#%llu v=%lu ec=%x dfsc=%x pc=%lx far=%lx\n",
+                   flt_n, c->cur_view, ec, esr & 0x3f, pc, addr);
+        flt_n++;
+    }
 
     /* 1) 我们桩的 BRK #0xCA0（EC=0x3C BRK，imm 在 iss[15:0]） */
     if (ec == 0x3C && ((iss & 0xFFFF) == 0xCA0)) {
@@ -416,7 +428,27 @@ asm(
  * 旧表的 EL1 槽路径（SPSR.M 位或 KP 改写向量路由），我们只接管了 0x400 槽。
  * 转发到旧入口时内核 handler 拿到我们的非标准帧 → 内核态二次异常 → 风暴。
  * 修复方向：EL0/EL1 的 Sync 槽都接管（0x200/0x400/0x600），或先在未命中
- * 路径改为"重建标准内核帧后调用旧 C 入口"而不是跳旧汇编入口。 */
+ * 路径改为"重建标准内核帧后调用旧 C 入口"而不是跳旧汇编入口。
+ *
+ * 悬案已破（2026-10-13 深夜）：flt# 零日志 + 内核态自旋 = 异常根本没进我们的
+ * 向量表——VBAR 是 per-CPU 寄存器，msr 只切了 insmod 所在核，目标进程在别的核
+ * 上 fault 仍走旧表 → SIGSEGV（被目标信号处理器接住）→ 用户态重试 → 内核态
+ * 持续处理 → 假死。修复：on_each_cpu 全核广播（地址经 cfg 注入）。 */
+
+static void caoin_vbar_set_on(void *info)
+{
+    asm volatile("msr vbar_el1, %0" :: "r"((unsigned long)caoin_vbar));
+    asm volatile("isb" ::: "memory");
+}
+
+static void caoin_vbar_set_off(void *info)
+{
+    struct caoin_cfg *c = &caoin_cfg_block;
+    if (!c->old_vbar)
+        return;
+    asm volatile("msr vbar_el1, %0" :: "r"((unsigned long)c->old_vbar));
+    asm volatile("isb" ::: "memory");
+}
 
 
 
@@ -469,13 +501,20 @@ static int __init caoin_init(void)
         asm volatile("mrs %0, vbar_el1" : "=r"(old_vbar));
         c->old_vbar = old_vbar;
         for (i = 0; i < 16; i++)
-        for (i = 0; i < 16; i++)
             tab[i] = old_vbar + i * 0x80;
         caoin_old_el0_sync = old_vbar + 0x400;
     }
-    /* 切 VBAR（对内核的全部触碰） */
-    asm volatile("msr vbar_el1, %0" :: "r"((unsigned long)caoin_vbar));
-    asm volatile("isb" ::: "memory");
+    /* 切 VBAR —— 全核！VBAR 是 per-CPU 寄存器，只切当前核的话，
+       目标进程在别的核上 fault 仍走旧表（SIGSEGV 重试 livelock） */
+    if (c->on_each_cpu) {
+        void (*oec)(void (*)(void *), void *, int) =
+            (void *)(unsigned long)c->on_each_cpu;
+        oec(caoin_vbar_set_on, NULL, 1);
+        CK_LOG("caoin2b: vbar broadcast via on_each_cpu\n");
+    } else {
+        asm volatile("msr vbar_el1, %0" :: "r"((unsigned long)caoin_vbar));
+        asm volatile("isb" ::: "memory");
+    }
     c->vbar_on = 1;
 
     /* 切 shadow 视图（先预检 pte 位置可写：原值回写测试） */
@@ -540,10 +579,16 @@ static void __exit caoin_exit(void)
     c->cur_view = 0;
     caoin_tlb_flush((unsigned long)c->target_va);
 
-    /* 恢复 VBAR */
+    /* 恢复 VBAR（全核广播，与 init 对称） */
     if (c->vbar_on && c->old_vbar) {
-        asm volatile("msr vbar_el1, %0" :: "r"((unsigned long)c->old_vbar));
-        asm volatile("isb" ::: "memory");
+        if (c->on_each_cpu) {
+            void (*oec)(void (*)(void *), void *, int) =
+                (void *)(unsigned long)c->on_each_cpu;
+            oec(caoin_vbar_set_off, NULL, 1);
+        } else {
+            asm volatile("msr vbar_el1, %0" :: "r"((unsigned long)c->old_vbar));
+            asm volatile("isb" ::: "memory");
+        }
         c->vbar_on = 0;
     }
 

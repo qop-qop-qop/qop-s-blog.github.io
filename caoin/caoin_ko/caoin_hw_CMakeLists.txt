@@ -1,0 +1,3 @@
+add_kpm_module(caoin-hw
+    caoin_hw.c
+)

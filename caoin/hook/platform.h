@@ -22,7 +22,7 @@
 #define CAOIN_SYS_memfd_create 279
 #define CAOIN_SYS_ftruncate 46
 
-static long caoin_sys6(long n, long a, long b, long c, long d, long e, long f)
+static __attribute__((unused)) long caoin_sys6(long n, long a, long b, long c, long d, long e, long f)
 {
     register long x8 asm("x8") = n;
     register long x0 asm("x0") = a;
@@ -44,37 +44,39 @@ static long caoin_sys6(long n, long a, long b, long c, long d, long e, long f)
 
 #define CAOIN_PAGE 4096UL
 
-static long caoin_memfd_create(void)
+static __attribute__((unused)) long caoin_memfd_create(void)
 {
-    return caoin_sys6(CAOIN_SYS_memfd_create, (long)"caoin", 0, 0, 0, 0, 0);
+    /* memfd 名伪装成 ART 的 jit-cache：app maps 里本来就有同名映射，
+     * 用 "caoin" 这类工具名会直接把身份写进 /proc/pid/maps（真机实测） */
+    return caoin_sys6(CAOIN_SYS_memfd_create, (long)"jit-cache", 0, 0, 0, 0, 0);
 }
 
-static long caoin_ftruncate(long fd, long len)
+static __attribute__((unused)) long caoin_ftruncate(long fd, long len)
 {
     return caoin_sys6(CAOIN_SYS_ftruncate, fd, len, 0, 0, 0, 0);
 }
 
-static long caoin_close_fd(long fd)
+static __attribute__((unused)) long caoin_close_fd(long fd)
 {
     return caoin_sys6(CAOIN_SYS_close, fd, 0, 0, 0, 0, 0);
 }
 
-static void *caoin_mmap(void *addr, size_t len, int prot, int flags, int fd, long off)
+static __attribute__((unused)) void * caoin_mmap(void *addr, size_t len, int prot, int flags, int fd, long off)
 {
     return (void *)caoin_sys6(CAOIN_SYS_mmap, (long)addr, (long)len, prot, flags, fd, off);
 }
 
-static int caoin_mprotect(void *addr, size_t len, int prot)
+static __attribute__((unused)) int caoin_mprotect(void *addr, size_t len, int prot)
 {
     return (int)caoin_sys6(CAOIN_SYS_mprotect, (long)addr, (long)len, prot, 0, 0, 0);
 }
 
-static int caoin_munmap(void *addr, size_t len)
+static __attribute__((unused)) int caoin_munmap(void *addr, size_t len)
 {
     return (int)caoin_sys6(CAOIN_SYS_munmap, (long)addr, (long)len, 0, 0, 0, 0);
 }
 
-static void *caoin_memcpy(void *dst, const void *src, size_t n)
+static __attribute__((unused)) void * caoin_memcpy(void *dst, const void *src, size_t n)
 {
     unsigned char *d = dst;
     const unsigned char *s = src;
@@ -82,7 +84,7 @@ static void *caoin_memcpy(void *dst, const void *src, size_t n)
     return dst;
 }
 
-static void caoin_flush_icache(void *beg, void *end)
+static __attribute__((unused)) void caoin_flush_icache(void *beg, void *end)
 {
     uintptr_t p = (uintptr_t)beg & ~(uintptr_t)31;
     for (; p < (uintptr_t)end; p += 32)
@@ -97,17 +99,18 @@ static void caoin_flush_icache(void *beg, void *end)
 #include <unistd.h>
 #include <sys/syscall.h>
 
-static long caoin_memfd_create(void)
+static __attribute__((unused)) long caoin_memfd_create(void)
 {
-    return syscall(SYS_memfd_create, "caoin", 0);
+    /* 同上：memfd 名伪装成 jit-cache，避免工具名进 maps */
+    return syscall(SYS_memfd_create, "jit-cache", 0);
 }
 
-static long caoin_ftruncate(long fd, long len)
+static __attribute__((unused)) long caoin_ftruncate(long fd, long len)
 {
     return syscall(SYS_ftruncate, fd, len);
 }
 
-static long caoin_close_fd(long fd)
+static __attribute__((unused)) long caoin_close_fd(long fd)
 {
     return close((int)fd);
 }
@@ -118,17 +121,17 @@ static long caoin_close_fd(long fd)
 #define CAOIN_MAP_PRIVATE_ANON (MAP_PRIVATE | MAP_ANONYMOUS)
 #define CAOIN_PAGE ((size_t)sysconf(_SC_PAGESIZE))
 
-static void *caoin_mmap(void *addr, size_t len, int prot, int flags, int fd, long off)
+static __attribute__((unused)) void * caoin_mmap(void *addr, size_t len, int prot, int flags, int fd, long off)
 {
     return mmap(addr, len, prot, flags, fd, off);
 }
 
-static int caoin_mprotect(void *addr, size_t len, int prot)
+static __attribute__((unused)) int caoin_mprotect(void *addr, size_t len, int prot)
 {
     return mprotect(addr, len, prot);
 }
 
-static int caoin_munmap(void *addr, size_t len)
+static __attribute__((unused)) int caoin_munmap(void *addr, size_t len)
 {
     return munmap(addr, len);
 }

@@ -1,1 +1,0 @@
-cmd_/mnt/f/github/qop-s-blog.github.io/caoin/caoin_ko/shadow_v2.ko := aarch64-linux-gnu-ld -EL -r  -T ./scripts/module-common.lds -T ./arch/arm64/kernel/module.lds --build-id  -o /mnt/f/github/qop-s-blog.github.io/caoin/caoin_ko/shadow_v2.ko /mnt/f/github/qop-s-blog.github.io/caoin/caoin_ko/shadow_v2.o /mnt/f/github/qop-s-blog.github.io/caoin/caoin_ko/shadow_v2.mod.o ;  true

@@ -1,0 +1,8 @@
+# 统一 LF（源码 + 构建脚本跨平台一致）
+* text=auto eol=lf
+
+# 二进制资源不转换
+*.so  binary
+*.elf binary
+*.bin binary
+*.png binary

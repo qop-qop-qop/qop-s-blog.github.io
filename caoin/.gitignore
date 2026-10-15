@@ -1,4 +1,20 @@
+# 构建产物
 build/
+hook/build/
 *.so
 *.o
 *.a
+
+# 内核模块构建残留（LKM 时代）
+*.ko
+*.mod.c
+*.mod.o
+*.cmd
+.tmp_versions/
+modules.order
+Module.symvers
+
+# 编辑器/系统
+*.swp
+*~
+.DS_Store

@@ -7,11 +7,11 @@ MARKER = 0xDEADCA03DEADCA03
 MAGIC = 0xCA03CA03CA03CA03
 
 def main():
-    if len(sys.argv) != 18:
+    if len(sys.argv) != 20:
         print("usage: patch_cfg2b.py <in.ko> <out.ko> <pid> <target_va> <shadow_phys> "
               "<expect_phys> <status_va> <find_task> <probe_read> <printk> "
-              "<status_phys> <probe_kernel_write> <kobject_del> <init_timer_key> "
-              "<mod_timer> <del_timer_sync> <jiffies>")
+              "<status_phys> <probe_kernel_write> <do_page_fault> <stop_machine> "
+              "<kobject_del> <init_timer_key> <mod_timer> <del_timer_sync> <jiffies>")
         return 1
     a = sys.argv
     data = bytearray(open(a[1], "rb").read())
@@ -20,14 +20,14 @@ def main():
         print("marker not found")
         return 1
     # 布局: marker,magic,pid,tva,sphys,ephys,sva,find_task,probe,printk,status_phys,
-    #       probe_write,kobject_del,t_init,t_mod,t_del,jiffies   (17Q)
+    #       probe_write,dpf,stop_machine,kobject_del,t_init,t_mod,t_del,jiffies (19Q)
     # pid 接受 0x 十六进制（int(...,0) 自动识别），其余按 hex
-    cfg = struct.pack("<17Q", MARKER, MAGIC, int(a[3], 0), int(a[4], 16),
+    cfg = struct.pack("<19Q", MARKER, MAGIC, int(a[3], 0), int(a[4], 16),
                       int(a[5], 16), int(a[6], 16), int(a[7], 16),
                       int(a[8], 16), int(a[9], 16), int(a[10], 16),
                       int(a[11], 16), int(a[12], 16), int(a[13], 16),
                       int(a[14], 16), int(a[15], 16), int(a[16], 16),
-                      int(a[17], 16))
+                      int(a[17], 16), int(a[18], 16), int(a[19], 16))
     data[off:off + len(cfg)] = cfg
     open(a[2], "wb").write(data)
     print(f"cfg @ {off:#x} -> {a[2]}")
