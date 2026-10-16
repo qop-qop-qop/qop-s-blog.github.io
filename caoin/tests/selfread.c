@@ -277,7 +277,7 @@ static int read_mode(void)
     if (read(fd, &b, 1) != 1)
         b = 0;
     close(fd);
-    if (b >= '1' && b <= '8')
+    if (b >= '1' && b <= '9')
         return (int)(b - '0');
     return 0;
 }
@@ -503,6 +503,33 @@ void _start(void)
             out_str(" | madv rc="); out_int(rc);
             out_str(" hooked="); out_int(st_hooked(round));
             out_str(" pfn="); out_hex(pgmap_pfn((unsigned long)mp));
+            out_str("\n");
+        }
+
+        /* C9（mode=9）：**同权限** mprotect 到底碰不碰 PTE —— 用来确认"判断发生在
+         * VMA 层、不在 PTE 层"。
+         *
+         * 内核 mprotect_fixup 只有一条早退：`newflags == vma->vm_flags` 就直接返回，
+         * 连 change_protection 都进不去。而 change_protection 才是唯一重写 PTE 的
+         * 地方。所以同权限 mprotect 应当**一个 bit 都不动**。
+         *
+         * 判据用读隐藏：先执行一次让页停在 SHADOW（execute-only），再 mprotect(r-x)
+         * （VMA 本来就是 r-x），然后从页外读受管页：
+         *   rd_eq_base=1 → PTE 仍是 execute-only（读被 caoin 翻 STEP 后拿到原页）
+         *                  ⇒ 同权限 mprotect 确实没碰 PTE（早退成立）
+         *   rd_eq_base=0 → PTE 已变可读（读到影子页内容）
+         *                  ⇒ change_protection 真跑了，早退不存在 */
+        if (mode == 9) {
+            int rc;
+            out_str("C9 r="); out_int(round);
+            out_str(" hooked0="); out_int(st_hooked(round));   /* 执行 → 页停 SHADOW */
+            out_str(" pfn0="); out_hex(pgmap_pfn((unsigned long)mp));
+
+            rc = mprotect((void *)mp, 4096, SR_PROT_RX);       /* 同权限 */
+            out_str(" | rx rc="); out_int(rc);
+            out_str(" pfn1="); out_hex(pgmap_pfn((unsigned long)mp));
+            out_str(" rd_eq_base=");
+            out_int(st_reader_outpage(mp, RD_N) == base_out);
             out_str("\n");
         }
 

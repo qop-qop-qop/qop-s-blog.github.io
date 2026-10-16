@@ -109,7 +109,7 @@ kpatch su kpm load caoin-hw.kpm "verbose=1;add <pid> <addr> if x1=5"   # 条件�
 
 | 约束 | 原因 | 影响 |
 |---|---|---|
-| **`mprotect`/`madvise` 改写受管页 PTE** | caoin 的状态（影子 PFN + execute-only 权限）只存在 PTE 里，而 `mprotect`/`madvise` 是**内核（EL1）**在改页表——PTE 的 AP/UXN 位只约束 EL0，对内核没有任何约束力。且 `mprotect` **保留 PFN、只重写权限位**（不是"把原页换回来"） | 实测（`selfread` mode 7）：`mprotect` 后影子页 PFN 不变，但后果取决于跷跷板当时停在哪一态——**SHADOW 态 → 影子页失去 execute-only、变成 EL0 可读 → 读隐藏破**（目标能读到桩字节，CRC 自检即可发现；实测 `rd_eq_base=0`）；**STEP 态 → 原页被改成可执行 → 桩静默失效且从此不再 fault**（实测桩立即变回原返回值并永久不再恢复）。`madvise(MADV_DONTNEED)` 则是 zap PTE、按 VMA 重建 → 回到原页、桩失效。同权限 `mprotect` 被内核早退、PTE 不动。自愈（重写影子 PTE）实测**救不回** |
+| **`mprotect`/`madvise` 改写受管页 PTE** | caoin 的状态（影子 PFN + execute-only 权限）只存在 PTE 里，而 `mprotect`/`madvise` 是**内核（EL1）**在改页表——PTE 的 AP/UXN 位只约束 EL0，对内核没有任何约束力。且 `mprotect` **保留 PFN、只重写权限位**（不是"把原页换回来"） | 实测（`selfread` mode 7）：`mprotect` 后影子页 PFN 不变，但后果取决于跷跷板当时停在哪一态——**SHADOW 态 → 影子页失去 execute-only、变成 EL0 可读 → 读隐藏破**（目标能读到桩字节，CRC 自检即可发现；实测 `rd_eq_base=0`）；**STEP 态 → 原页被改成可执行 → 桩静默失效且从此不再 fault**（实测桩立即变回原返回值并永久不再恢复）。`madvise(MADV_DONTNEED)` 则是 zap PTE、按 VMA 重建 → 回到原页、桩失效。同权限 `mprotect` 被内核早退、PTE 不动（实测确认）。自愈（重写影子 PTE）实测**救不回** |
 | **KPM shadow 并发下 TLB 抖动** | 每次视图切换会在别的核留下陈旧翻译，纠正一次 = 一次全量 `tlbi vmalle1is`（本机 `vaae1is` 在 fault 上下文活锁、`alle1is` panic，只剩全量可用） | 修复前实测 4 线程下 98% 的 handler 进入都在纠正陈旧 TLB，且**一 engage 就活锁**；修复（桩装完补 flush + 取指 permission fault 也纠正）后同一压测（4 线程 / 4.19e9 次迭代）取指纠正降到 1727 次、`bad=0`。低频调用场景可忽略 |
 | **agent 破 CRC 自检** | inline hook 必然改写目标函数字节 | 有完整性校验的目标不能用 agent |
 | **agent 短函数装不上** | 跳转桩需 ≥16 字节，而 bionic 大量函数是短系统调用包装（如 `getpid` ≈ 12B） | 需 PLT hook 等补充手段（当前未实现） |
@@ -150,7 +150,7 @@ caoin/
 ├── cli/               # injector.c（ptrace 注入）/ prep.c（符号解析 + 页准备）
 ├── hook/              # ARM64 hook 原语（重定位、跳转桩）+ 主机端单测
 ├── tests/             # 测试目标与检测样本（target_dyn / shtarget / shellwatch / selfread / poke64）
-│                      #   selfread：8 格实验目标（自指读 / 页内读别页 / 跨页调用探针 / 改参数 / fork / 多线程 / mprotect / madvise）
+│                      #   selfread：9 格实验目标（自指读 / 页内读别页 / 跨页调用探针 / 改参数 / fork / 多线程 / mprotect / madvise / 同权限 mprotect 判据）
 └── docs/DEVLOG.md     # 开发日志（实测记录、踩坑实录、路线演进）
 ```
 

@@ -139,9 +139,21 @@ shva+0xA00  trampoline（重定位后的 4 条序言 + 尾桩跳回 tva+off+16�
   一旦先读一次把页翻到 STEP 再 mprotect → 桩**立即死且不再回来**（r=18 活、r=19 起恒为原值）。
   所以"目标周期性 mprotect 自己代码页"确实能打死 hook，但机制是**STEP 态被改成可执行**，
   不是"回到原页"。
-- **同权限 `mprotect` 是内核早退**：`mprotect_fixup` 在 `newflags == vma->vm_flags` 时直接返回，
-  连 `change_protection` 都进不去 → PTE 一个 bit 都不动。（此条为内核源码推演，实测无法与
-  "重跑一遍同样的权限"区分，故标注为未直接验证。）
+- **同权限 `mprotect` 是内核早退（实测确认）**：`mprotect_fixup` 只有一条早退——
+  `newflags == vma->vm_flags` 就直接返回，连 `change_protection` 都进不去，
+  而 `change_protection` 才是唯一重写 PTE 的地方 → PTE 一个 bit 都不动。
+  实测（C9 格）：先执行一次让页停在 SHADOW（`pfn0` = 影子页），再 `mprotect(r-x)`
+  （VMA 本来就是 r-x），结果 `rc=0`、`pfn1` 仍是影子页、`rd_eq_base=1`
+  （页外读仍拿原页 ⇒ PTE 仍是 execute-only），连轮稳定且桩不受影响。
+  **⇒ "判断发生在 VMA 层、不在 PTE 层" 得到实测支持。**
+- **内核从不看 PTE 里现在是什么**。整个 mprotect 路径里唯一与 PTE 有关的判断是
+  `pte_present()`：present 就按 VMA 的新权限重写，not-present 就跳过。没有任何一步
+  会去比对"当前 PTE 与 VMA 是否一致"。内核把 PTE 当作 **VMA 权限的缓存**，
+  mprotect 就是一次缓存刷新——它假定两者本来就一致，从不校验。
+  这正是 caoin 能工作的原因（PTE 故意与 VMA 不一致：execute-only + 影子 PFN），
+  也是 mprotect 致命的原因（强制把 PTE 刷成 VMA 的样子，把刻意造出的不一致抹平）。
+  另一处同类假设是 rmap 与 PTE 的一致性（影子页没有 rmap 项）—— 那是
+  `Bad rss-counter` 的来源，caoin 用 `exit_mmap` 钩子兜（见 P3-v4 节点）。
 - **`madvise(MADV_DONTNEED)` 才是"回到原页"**：zap PTE，下次访问由**原生**缺页路径按 VMA 重建
   → 桩静默失效。
 - **自愈尝试失败**：在目标进程的任意 fault 上限频重 walk 受管 PTE、发现漂移就重写影子值
