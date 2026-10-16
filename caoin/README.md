@@ -8,16 +8,16 @@ Android arm64 无痕 hook 工具集。面向 frida 等公开工具特征明显�
 
 | 组件 | 类型 | 作用 | 关键约束 |
 |---|---|---|---|
-| **caoin-shadow** | 内核 KPM | shadow 页读写分离：改返回值 / 执行流，**不改代码字节**（过 CRC 自检） | 受管函数须**独占页** |
+| **caoin-shadow** | 内核 KPM | shadow 页读写分离：改返回值 / 改参数（`argN=`，x0..x30）/ **透传执行原逻辑**（重定位桩），**不改代码字节**（过 CRC 自检）；影子页与 status 页**内核分配** → 目标 maps **零新增** | 目标对受管页做 `mprotect`/`madvise` → hook **静默失效**（页表被内核合法改写；实测自愈救不回） |
 | **caoin-hw** | 内核 KPM | 硬件断点：参数观察、改寄存器（地址级，不碰 PTE/内存） | 仅 6 个断点槽；不能改执行流 |
 | **caoin_agent** | 用户态 so | 用户态 inline hook（注入目标进程，memfd 隐匿加载） | 改代码字节 → **破 CRC 自检**；短函数装不下 |
 | **caoin_inject** | CLI | ptrace 注入器（memfd 加载、配置化 hook 点、日志回传） | 准备期使用 ptrace |
-| **caoin_prep** | CLI | KPM 流程自动化：远程符号解析 + 影子页/status 页准备 → 输出 KPM args | 只解析 dynsym（共享库导出符号） |
+| **caoin_prep** | CLI | KPM 流程自动化：远程符号解析（+ 可选准备影子页/status 页）→ 输出 KPM args | 只解析 dynsym（共享库导出符号）；`nommap` 模式全程不用 ptrace |
 
 ## 架构
 
 ```
-用户态  ┌─ caoin_prep ──→ 解析符号 + 准备影子页/status 页 ──→ args
+用户态  ┌─ caoin_prep ──→ 解析符号（影子页可交给内核分配）──→ args
         │                                                        │
         └─ caoin_inject ──→ ptrace 注入 agent.so（memfd 隐匿）    │
                                                                  ▼
@@ -78,6 +78,21 @@ kpatch su kpm load caoin-shadow.kpm "<上面输出的 args> stub=1"
 kpatch su kpm unload caoin-shadow
 ```
 
+**改参数 + 透传**（`recstub`：先覆盖寄存器，再跑**原逻辑**，返回值真实）：
+
+```bash
+# nommap：影子页/status 页交给 KPM 内核分配（目标 maps 零新增，全程不用 ptrace）
+caoin_prep <pid> <module|@> <symbol> nommap
+# → pid=0x.. tva=0x..
+
+# stubmode=2 走重定位桩；argN= 覆盖 xN（x0..x30，1~2 位数字）
+kpatch su kpm load caoin-shadow.kpm \
+  "pid=0x.. tva=0x.. stub=1 stubmode=2 arg0=0x64 arg1=0x0"
+```
+
+重定位桩会重定位**被入口桩覆盖的 4 条序言指令**（跨页 B/BL、ADR/ADRP、CBZ/TBZ、LDR literal），
+之后函数体在原偏移继续执行 —— 所以能 hook **真实函数**（旧版不做重定位，只支持"寄存器运算型"）。
+
 ### KPM 硬件断点（参数观察 / 改寄存器）
 
 ```bash
@@ -94,7 +109,8 @@ kpatch su kpm load caoin-hw.kpm "verbose=1;add <pid> <addr> if x1=5"   # 条件�
 
 | 约束 | 原因 | 影响 |
 |---|---|---|
-| **KPM shadow 要求受管函数独占页** | 跷跷板翻转是 **PTE 页粒度**的（ARM64 最小 4KB，无指令级 PTE） | 页内若有其他被执行的代码，状态机会被干扰、桩不生效 |
+| **`mprotect`/`madvise` 让 KPM shadow 静默失效** | 影子页的状态（影子 PFN + execute-only 权限）**存在 PTE 里**；内核对页表的任何合法操作——VMA 权限重刷（`mprotect`）、`zap_page_range`（`madvise(MADV_DONTNEED)`）、页回收——都会覆盖它 | 目标周期性 `mprotect` 自己代码页即可让 hook 失效，**且无任何报错**（受管页变回可读可执行 → 从此不再 fault → handler 无从察觉）。自愈（重写影子 PTE）实测**救不回**：页表结构已被拆，重写落空 |
+| **KPM shadow 并发下 TLB 抖动** | 每次视图切换会在别的核留下陈旧翻译，纠正一次 = 一次全量 `tlbi vmalle1is`（本机 `vaae1is` 在 fault 上下文活锁、`alle1is` panic，只剩全量可用） | 修复前实测 4 线程下 98% 的 handler 进入都在纠正陈旧 TLB，且**一 engage 就活锁**；修复（桩装完补 flush + 取指 permission fault 也纠正）后同一压测（4 线程 / 4.19e9 次迭代）取指纠正降到 1727 次、`bad=0`。低频调用场景可忽略 |
 | **agent 破 CRC 自检** | inline hook 必然改写目标函数字节 | 有完整性校验的目标不能用 agent |
 | **agent 短函数装不上** | 跳转桩需 ≥16 字节，而 bionic 大量函数是短系统调用包装（如 `getpid` ≈ 12B） | 需 PLT hook 等补充手段（当前未实现） |
 | **改关键函数返回值会崩** | 非 caoin 特有，frida 同样如此 | 改值要挑函数 / 用条件 hook |
@@ -106,7 +122,7 @@ kpatch su kpm load caoin-hw.kpm "verbose=1;add <pid> <addr> if x1=5"   # 条件�
 | 路线 | CRC 自检 | maps 痕迹 | 改执行流 |
 |---|---|---|---|
 | agent（inline hook） | ✗ 破 | 新增 memfd/可执行映射 | ✓ |
-| KPM shadow | ✓ 不破 | 无新增（影子页是匿名 mmap） | ✓ |
+| KPM shadow | ✓ 不破 | **零新增**（影子页内核分配；实测 maps 95→95 无 diff） | ✓ |
 | KPM 硬件断点 | ✓ 不破 | 无（不动内存） | ✗（仅改寄存器） |
 
 ## 与 wxshadow 的关系
@@ -117,7 +133,9 @@ kpatch su kpm load caoin-hw.kpm "verbose=1;add <pid> <addr> if x1=5"   # 条件�
 - **翻转粒度**：wxshadow per-page 全局；caoin per-hook 表（多 hook 独立状态）
 - **控制入口**：wxshadow 用 prctl；caoin 用 load args / 内核态注入
 
-效果等价（都是"原页字节不变 + 执行重定向"）。**caoin 相对 wxshadow 的真正增量是**：内核态注入（无 ptrace 特征）、端到端工具链（符号解析 + 自动化）、以及另外两条路线（用户态 agent、硬件断点）。
+效果等价（都是"原页字节不变 + 执行重定向"）。**caoin 相对 wxshadow 的真正增量是**：内核态注入（无 ptrace 特征）、端到端工具链（符号解析 + 自动化）、自指读软件模拟（解掉独占页约束）、重定位桩（能 hook 真实函数），以及另外两条路线（用户态 agent、硬件断点）。
+
+**两者的共同边界**：状态都存在 PTE 里 → `mprotect` / `madvise` 会让 hook 静默失效。wxshadow 的 per-page PTE 锁解决的是**并发竞态**，解决不了"页表被内核合法改写"。
 
 ## 项目结构
 
@@ -125,12 +143,14 @@ kpatch su kpm load caoin-hw.kpm "verbose=1;add <pid> <addr> if x1=5"   # 条件�
 caoin/
 ├── caoin_ko/          # 内核 KPM 模块
 │   ├── caoin_kpm.c    #   caoin-shadow：shadow 页读写分离
+│   ├── caoin_reloc.c  #     KPM 侧 arm64 指令重定位器（recstub 用）
 │   ├── caoin_hw.c     #   caoin-hw：硬件断点
 │   └── legacy/        #   退役路线源码（LKM 换页版 v1/v2b/v2d/v2e），仅存档
 ├── agent/             # 用户态 agent（注入目标进程的 inline hook）
 ├── cli/               # injector.c（ptrace 注入）/ prep.c（符号解析 + 页准备）
 ├── hook/              # ARM64 hook 原语（重定位、跳转桩）+ 主机端单测
-├── tests/             # 测试目标与检测样本（target_dyn / hwtarget / shtarget / shellwatch / poke64）
+├── tests/             # 测试目标与检测样本（target_dyn / shtarget / shellwatch / selfread / poke64）
+│                      #   selfread：7 格实验目标（自指读 / 页内读别页 / 跨页调用探针 / 改参数 / fork / 多线程 / mprotect）
 └── docs/DEVLOG.md     # 开发日志（实测记录、踩坑实录、路线演进）
 ```
 

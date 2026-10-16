@@ -19,7 +19,118 @@
 - [x] **P3-v5（参数观察，2026-10-15）**：硬件断点 KPM（`caoin_ko/caoin_hw.c`，构建产物 `caoin-hw.kpm`）——借鉴 kern/Hook 的 hw_hook 思路重写：直写 DBGBVR/BCR/WVR/WCR + hook 4.9 的 breakpoint_handler/single_step_handler/watchpoint_handler + `__switch_to` per-CPU 编程 + 单步恢复协议；**真机验证通过**（断点命中+寄存器改写+单步恢复+干净卸载+压力回归，见下节）
 - [x] **app 域注入实战（2026-10-15）**：真实用户 app（untrusted_app 域）上跑通完整注入链路——root ptrace app + memfd 隐匿加载 agent + 用户态 inline hook + 日志回传；**顺带修一处特征泄露**（trampoline memfd 名 "caoin" → "jit-cache"）。实测见下节。
 - [x] **ll 壳双层检测对抗实测（2026-10-15）**：自建检测样本（代码段 CRC 自检 + maps 扫描 + TracerPid），对照 caoin 两条路线。**结论：agent（inline hook）过不了 CRC 自检（改字节）、maps 暴露；KPM shadow 双层全过**（CRC 不破 + maps 干净 + 桩生效）。修正原论断（"agent memfd = 完整解"不成立）。见下节。
+- [x] **P3-v6（2026-10-15~16）**：自指读软件模拟（D）**解掉独占页约束**；影子页/status 页下沉内核分配（**目标 maps 零足迹**）；recstub 接重定位器（**能 hook 真实函数**）+ `argN=` 覆盖 x0..x30；并发 TLB 陈旧两处修复（不 engage + 一 engage 就活锁）；并发插桩（entries/overlap/desync）。**能力边界修正：`mprotect`/`madvise` 无解（自愈实测失败）**
 - [ ] 后置：Java 层下沉的 ArtMethod 全覆盖；更强反调试（信号/时序类）对抗
+
+## P3-v6（2026-10-15 ~ 16）：自指活锁定位 → 内核页下沉 → 重定位桩 → 并发 TLB 修复
+
+### 1. 独占页约束：根因定位并解除
+
+原记录是"受管页内若有其他被执行的代码 → 状态机被频繁打断、桩不生效"，并据此要求
+**受管函数独占页**。本轮用自建实验目标 `tests/selfread.c` 把它拆开验证：
+
+- **对照 C2**（读指令在受管页内、读**别的**页）→ 488 轮全正常 → **"页内有可执行代码"本身无害**。
+- **处理组 C3**（读指令在受管页内、读**受管页**，即自指读）→ **活锁**：dmesg 实测
+  `ec=24`/`ec=20` 严格 35/35 交替、全部 fault 的 `pc` 与 `far` 同落受管页、进程 ~82% stime 烧满。
+  根因：翻转后 `eret` 要重取指，而重取指被 STEP 的 UXN 挡住 → 两态互斥 → 无限振荡。
+- 顺带证明**"跨页 PC 相对寻址"不是约束**：影子页占的是**受管页的 VA**（PTE 只换 PFN），
+  PC 从不改变，所以 `b`/`bl`/`adrp` 全部照常算对（探针 `st_xpage` 实测）。
+  （此前"影子页会破坏跨页相对寻址、需要重编译器"的推演**错误，已撤回**。）
+
+**修法（D，自指读软件模拟）**：SHADOW 视图下若 `(regs->pc >> 12) == tva >> 12`（取指就在受管页内），
+**不翻转**，改在 handler 里代读原页 → 写进目标寄存器 → `pc += 4` 跳过该指令。
+指令被跳过而不是重试 → 不需要重取指 → 振荡的另一支被拆掉，PTE 全程不动。
+实测 C3 从"第 488 轮卡死"变成持续通过（`match=1`），**独占页约束解除**。
+
+补记：D 起初只解码"立即数寻址"一族，漏了 `LDR (literal)` —— 而 recstub 的入口桩
+（`LDR X16,#8`）本身就是自指读，缺它必活锁（实测 `pc=入口桩`、`far=入口桩+8`）。已补。
+
+### 2. 影子页 / status 页下沉内核分配 → 目标 maps 零足迹
+
+原方案由 `caoin_prep` 在目标进程远程 `mmap` 影子页 + status 页 → 目标 maps 多两条匿名 VMA
+（实测 93→95；判据"无名 + rw-p + 恰好一页"从 0 变 2）。
+
+改为 KPM 用 `__get_free_pages`（`GFP_KERNEL=0xcc0`，与 wxshadow 同生态实测值）分配、
+只把 PFN 写进目标 PTE → **目标 maps 零新增**（实测 95→95，`diff` 无输出）。
+`shva`/`sva` 变成可选参数，`caoin_prep nommap` 只解析符号（且全程不用 ptrace）。
+
+配套修复：
+
+- `caoin_locate` 原来强制两次 walk（第二次拿 status 页 VA 做交叉校验），无用户态 status 页时
+  没有 `va2` 可 walk → 改为跳过该层校验。
+- 卸载释放的判据：**所有 hook 的 `cur_view` 都回到 VIEW_OFF** 之后才 `free_pages`；
+  否则宁可泄漏两页也不 UAF（目标 PTE 指向已释放页 = 随机内核写）。
+
+### 3. recstub 接重定位器 → 从"改返回值"升级到"能 hook 真实函数"
+
+原 recstub 把函数体拷到 `shva+0x800` scratch 且**不做重定位**，所以只支持"寄存器运算型"函数。
+
+把 agent 侧的重定位器移植进 KPM（新增 `caoin_ko/caoin_reloc.c`：自包含、KP 类型、
+读目标 VA 走 `caoin_kpm_read_va`——受管页 VA 重定向到影子页线性地址 + 其余 `probe_read` 安全读），
+并把 recstub 改成"入口桩 + handler + 重定位 trampoline"：
+
+```
+shva+off    入口桩（adrp+add+br，3 条，不读内存）
+shva+0x800  handler（可选改 xN，然后跳 trampoline）
+shva+0xA00  trampoline（重定位后的 4 条序言 + 尾桩跳回 tva+off+16）
+```
+
+尾桩跳回的是**受管页原 VA** —— SHADOW 视图下该 VA 映射到影子页，所以取到影子页里的第 5 条指令，
+**函数体在原偏移继续执行**，相对寻址全部正确。
+
+踩坑（三个，全真机定位）：
+
+1. **顺序**：先写入口桩、后做重定位 → 重定位失败时留下半装桩，handler 的 `b trampoline`
+   跳进没写过的区域 → 目标 SIGSEGV。改为**先重定位、成功才写桩**。
+2. **`CAOIN_PAGE_MASK` 用反**：它是 `~0xFFF`（保留页基址），取基址要 `& CAOIN_PAGE_MASK`；
+   写成 `& ~CAOIN_PAGE_MASK` 是取**偏移** → trampoline 地址算成 `0x940` → 重定位必然超范围。
+3. **桩的 `LDR literal` 语义冲突**：入口桩/尾桩原用 `LDR X16,#8; BR X16; <addr>`，
+   那个 literal 在**受管页**内；而 D 的模拟是**从原页读**的（CRC 场景的正确语义）→
+   桩拿到原页的指令字节 = 垃圾地址 → `BR` 飞掉 → SIGSEGV。**改成 `adrp+add+br`，桩不读内存。**
+
+验收：`arg0=0x64 arg1=0x0` 让双参数函数 `st_hooked3(n,1000)` 从 `3n+3007` 变成恒定 `307`
+（x0=100、x1=0 都生效，且原函数被真实执行）。`argN=` 覆盖 x0..x30（`movz/movk` 按需生成、
+跳过高位全零的 `movk`；handler 有空间守卫，溢出则**什么都不装**）。
+
+### 4. 并发 TLB 陈旧：hook 不 engage + 一 engage 就活锁
+
+4 线程压测（`selfread` mode=6，4.19e9 次迭代）暴露两个真实 bug，并加了可数的插桩
+（`entries`/`overlap`/`desync_a`/`desync_b`，进出配平、限频打点、卸载时无条件汇总）：
+
+- **修复前**：`entries=1.03e9`、`overlap` 98.5%、`desync_a` 98.4%（几乎全是取指 abort），
+  目标 `state=R` 空转、`hooked` 仍是原值 —— **seesaw 根本没 engage，且一 engage 就活锁**。
+- **根因 1（不 engage）**：安装早期的 flush 之后、桩写入之前，目标仍在并发跑，TLB 被重新填回
+  **旧**翻译；旧翻译指向原页（可读可取指）→ 永不 fault → 永不自愈。
+  修法：**桩装完后再 flush 一次**（并重新 walk 读回 PTE 自检）。
+- **根因 2（活锁）**：SHADOW 视图收到**取指 permission fault** 时原代码 `return 0` 放行给原生路径，
+  而原生路径不会 flush TLB（PTE 本就是"对的"）→ 同一份陈旧翻译反复 fault。
+  修法：`ec==0x20 && (esr&0x3C)==0x0C` 时 flush + eret 重试（与已有的 STEP+data 那条对称）；
+  translation fault 仍放行。
+- **修复后**：`overlap` 110、`desync_a` 1727、`desync_b` 7.46e7（走已有处理路径）、
+  `hooked=777`、`bad=0`、`state=S`、卸载干净、无 Bad page/panic。
+
+**这很可能就是早期"页内有其他执行的代码 → 桩不生效"那条观测的机制**：并发访问让 TLB 与视图脱同步，
+而 caoin 把取指 fault 放行给原生路径。也解释了为什么此前所有验证目标都是单线程的。
+
+（另注：本轮之前的一次"多线程测试通过"结论**作废**——`-O2` 把 `st_hooked(0)` 当纯函数死代码删了，
+线程只读不取指，测试是空跑。已用 `volatile` 函数指针修正。）
+
+### 5. 能力边界修正：`mprotect` / `madvise` 无解（自愈实测失败）
+
+对照公开的 ACE（腾讯反作弊）字节级逆向笔记：ACE 的扫描器会**把 r-xp 页 `mprotect` 成 RWX 再 CRC**
+—— 也就是**反作弊的例行扫描本身就会把这类 hook 清掉**。于是专门测了这条：
+
+- 测试格子 C7：对受管页做 `mprotect(RX)`（同权限 → 内核 no-op）与 `madvise(MADV_DONTNEED)`
+  （zap PTE，下次访问按 VMA 重建）。
+- 实测：`madvise` 之后桩**静默失效**（`hooked` 从 777 掉回原值，caoin 无任何察觉）。
+- **自愈尝试失败**：在目标进程的任意 fault 上限频重 walk 受管 PTE、发现漂移就重写影子值
+  —— 自愈**确实触发**（日志 `re-arm hook0 pte 0 -> <shadow>`），但**取指仍然 translation fault**：
+  `madvise` 拆的是**页表结构**而不是单个 PTE 值，重写落空。
+  **结论：页表类状态方案对 `mprotect`/`madvise` 无解**（与 wxshadow、UXN 同病；
+  UXN 的 README 自己就承认 `mprotect` 让它失效）。
+
+**修正后的路线定位**：改行为走 shadow（零足迹、过 CRC、不抗页表改写）；观察走 caoin-hw
+（DBG 寄存器不在页表里，天然免疫 `mprotect`）；对抗页表改写类检测无解。
 
 ## P3-v5 硬件断点模块（caoin-hw，2026-10-15 真机验证通过）
 
@@ -78,11 +189,11 @@ kpatch su kpm load caoin-shadow.kpm "pid=0x2cbc tva=0x61eb97cfe0 shva=0x7ae766a0
 
 **踩坑（4 个，全部真机定位）**：
 1. **静态链接程序无 `.dynsym`**：`-rdynamic` 只对动态链接生效；静态程序的 local 符号在 `.symtab`（不映射内存，远程读不到）→ 测试目标必须动态链接（实战目标是共享库，导出符号天然在 dynsym）。
-2. **受管页内其他被执行的代码干扰跷跷板**：caoin-shadow 的翻转是**页级**的——页内若有其他被执行的代码（如主循环），状态机被频繁打断、桩不生效（`DUMP far=<页内其他偏移> esr=9600000f` 内核态 fault）。**受管函数须独占页**（tdyn4 用 `aligned(4096)+fill`；shtarget 用汇编 `.balign 4096 + .fill 64` 让函数在页内偏移 0xfe0、页内其余为不执行的填充）。
+2. **受管页内其他被执行的代码干扰跷跷板**：caoin-shadow 的翻转是**页级**的——页内若有其他被执行的代码（如主循环），状态机被频繁打断、桩不生效（`DUMP far=<页内其他偏移> esr=9600000f` 内核态 fault）。**受管函数须独占页**（tdyn4 用 `aligned(4096)+fill`；shtarget 用汇编 `.balign 4096 + .fill 64` 让函数在页内偏移 0xfe0、页内其余为不执行的填充）。→ **P3-v6 修正：真正致命的是"页内自指读"（读受管页自身）+ 并发 TLB 脱同步，已由 D 与两处 TLB 修复解除；独占页约束不再是架构固有。详见 P3-v6 节点。**
 3. **status 页未 fault-in**：KPM 经内核线性映射读 status 页，PTE 未 present 时 PFN 推导失败（`wstat slot unreadable`）→ caoin_prep 须写一次触发缺页。
 4. **KPM 会覆写 status**（写 5/6/7 握手标记），故 caoin_prep 预写 INJ_REQ 无效 → 加 `stub=1` 直接装桩。
 
-**残留限制**：caoin_prep 只能解析 dynsym（共享库导出符号）；**页级独占约束**是 caoin-shadow 架构固有的（参数观察类需求用 caoin-hw 硬件断点，无此约束）。
+**残留限制**：caoin_prep 只能解析 dynsym（共享库导出符号）；**页级独占约束**是 caoin-shadow 架构固有的（参数观察类需求用 caoin-hw 硬件断点，无此约束）。→ **P3-v6 修正：独占页约束已由自指读模拟（D）解除，见 P3-v6 节点。**
 
 ## app 域注入实战（2026-10-15 真机验证通过）
 
@@ -99,7 +210,7 @@ kpatch su kpm load caoin-shadow.kpm "pid=0x2cbc tva=0x61eb97cfe0 shva=0x7ae766a0
 
 **顺带修复：特征泄露**。agent 的 trampoline memfd 原用名字 `"caoin"` → `/proc/pid/maps` 直接显示 `/memfd:caoin (deleted)`，**把工具身份写进了目标 maps**（与"低特征"目标直接冲突）。改为 `"jit-cache"`——伪装成 ART 自己的 JIT 代码缓存（app maps 里本来就有同名映射，反而起混淆作用）。修复后 maps 只见 `/memfd:cache`（agent so）+ `/memfd:jit-cache`（trampoline），无工具名。
 
-**KPM 路线在 app 域的适用性**：caoin-shadow 页级翻转要求受管函数独占页，app 的共享库函数（libc 等）与大量代码同页 → **不适用**；app 域 hook 走 agent（用户态 inline hook，无页约束）。参数观察类需求可用 caoin-hw（硬件断点，地址级）。
+**KPM 路线在 app 域的适用性**：caoin-shadow 页级翻转要求受管函数独占页，app 的共享库函数（libc 等）与大量代码同页 → **不适用**；app 域 hook 走 agent（用户态 inline hook，无页约束）。参数观察类需求可用 caoin-hw（硬件断点，地址级）。→ **P3-v6 修正：独占页约束已解除（自指读模拟 D），同页函数可 hook，所以"同页 → 不适用"这条不再成立。新的实际约束是 `mprotect`/`madvise`（app 自己或加固壳刷 VMA 权限即静默失效）。**
 
 ## ll 壳双层检测对抗实测（2026-10-15 真机验证）
 
@@ -122,7 +233,7 @@ kpatch su kpm load caoin-shadow.kpm "pid=0x2cbc tva=0x61eb97cfe0 shva=0x7ae766a0
 - **agent 的 inline hook 必然改目标代码字节 → 过不了 CRC 自检**（`crc=CHANGED`）；且 dlopen 的 agent so + trampoline 会新增 memfd/可执行/路径映射，maps 扫描能数出来。
 - **KPM shadow 是 CRC 自检的正解**：读写分离（执行走 shadow、读取走原页）→ 原页字节不变 → `crc=ok`；影子页是匿名 mmap（无路径、非可执行 VMA）→ `exec/susp/memfd` 全不变。
 - 所以"双层检测的完整解"= **KPM shadow 防 CRC** + （agent 只在**不触碰被自检代码**时用，且其 memfd 只解决**路径黑名单**这一种 maps 检测，**maps diff/计数仍能发现**）。
-- **约束**：KPM shadow 要求受管函数独占页（本样本满足）；实战中若目标函数与大量代码同页，该路线不适用（见 P3-v4 架构约束记录）。
+- **约束**：KPM shadow 要求受管函数独占页（本样本满足）；实战中若目标函数与大量代码同页，该路线不适用（见 P3-v4 架构约束记录）。→ **P3-v6 修正：该约束已解除（自指读模拟 D），同页函数可 hook。**
 
 **未覆盖**：更强反调试（信号/时序类、ptrace 自附加、硬件断点/调试寄存器检测）未在本样本内——归入后续"更强反调试对抗"。
 

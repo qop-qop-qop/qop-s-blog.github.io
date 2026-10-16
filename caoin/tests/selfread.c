@@ -94,6 +94,11 @@ extern void _exit(int);
 extern int waitpid(int, int *, int);
 extern int pthread_create(unsigned long *th, const void *attr,
                           void *(*fn)(void *), void *arg);
+extern int mprotect(void *addr, unsigned long len, int prot);
+extern int madvise(void *addr, unsigned long len, int advice);
+
+#define SR_PROT_RX      5   /* PROT_READ | PROT_EXEC */
+#define SR_MADV_DONTNEED 4
 
 /* ---- 受管页布局 ---- */
 asm(".pushsection .st.text, \"ax\"\n.balign 4096\n.fill 64, 1, 0\n.popsection");
@@ -249,7 +254,7 @@ static int read_mode(void)
     if (read(fd, &b, 1) != 1)
         b = 0;
     close(fd);
-    if (b >= '1' && b <= '6')
+    if (b >= '1' && b <= '7')
         return (int)(b - '0');
     return 0;
 }
@@ -423,6 +428,25 @@ void _start(void)
             out_str(" ok="); out_int((long)g_race_ok);
             out_str(" bad="); out_int((long)g_race_bad);
             out_str(" hooked="); out_int(st_hooked(round));
+            out_str("\n");
+        }
+
+        /* C7（mode=7）：mprotect / madvise 自检 —— 反作弊的"免费一枪"。
+         * mprotect 会用 VMA 的 vm_page_prot 重刷 PTE；madvise(MADV_DONTNEED)
+         * 直接 zap PTE、下次访问由**原生**缺页路径按 VMA 重建。两者都会把影子页
+         * 的 PTE 覆盖掉 → 桩静默失效（caoin 的 cur_view 还停在 SHADOW，无任何察觉）。
+         * 注意：**同权限的 mprotect 是 no-op**（内核早退），所以 mp_hooked 预期不变；
+         * 真正生效的是 madvise 那一步。 */
+        if (mode == 7 && (round % 8) == 0) {
+            int rc1, rc2;
+            out_str("C7 r="); out_int(round);
+            out_str(" pre="); out_int(st_hooked(round));
+            rc1 = mprotect((void *)mp, 4096, SR_PROT_RX);
+            out_str(" mp_rc="); out_int(rc1);
+            out_str(" mp_hooked="); out_int(st_hooked(round));
+            rc2 = madvise((void *)mp, 4096, SR_MADV_DONTNEED);
+            out_str(" madv_rc="); out_int(rc2);
+            out_str(" madv_hooked="); out_int(st_hooked(round));
             out_str("\n");
         }
 

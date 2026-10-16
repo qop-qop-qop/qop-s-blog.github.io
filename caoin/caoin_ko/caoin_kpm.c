@@ -81,6 +81,24 @@ static volatile int g_in_mh;
  * 把 PTE 修回原页 → hook 静默失效）。两者都为 0 → 根本没有 fault → 是 TLB
  * 一直用旧翻译（PTE 已翻但没生效）。 */
 static volatile u64 g_mf_seen, g_mf_nottarget;
+
+/* ---- 自愈（路线 1）：mprotect/madvise/回收会用 VMA 的 vm_page_prot 重刷或
+ * zap 受管页 PTE → 影子 PFN 被覆盖回原页 → 桩静默失效，且受管页从此不再
+ * fault（可读可执行）→ handler 无从察觉。
+ * 这里在目标进程的**任意** fault 上限频重 walk 受管 VA 的 PTE：发现 PFN 漂移
+ * 且视图未 OFF → 重写影子 PTE + 翻回 SHADOW + flush，把 hook 拉回来。
+ * 必须用目标的 fault 触发（失效后受管页不再 fault，所以不能把检查放在
+ * 受管页分支里）。
+ *
+ * **默认关闭（rearm=1 才开）**：真机实测该自愈**救不回** madvise——重写确实
+ * 触发了（日志 `re-arm hook0 pte 0 -> <shadow>`），但取指仍然 translation fault：
+ * madvise 拆的是**页表结构**而不是单个 PTE 值，重写落空；更糟的是此时内核正在
+ * 拆页表，walk 到的 L3 可能已被释放复用 → 往复用页里写 = 随机内核内存写。
+ * 所以默认路径不放它，保留代码是为了记录这条路线已被实测否掉（DEVLOG P3-v6 §5）。 */
+#define CAOIN_REARM_MASK 0x0F   /* 每 16 次目标 fault 查一次 */
+static u64 g_rearm_on;          /* rearm=1 开自愈；**默认关**，见上 */
+static u64 g_rearm_tick;
+static volatile u64 g_rearm_cnt;
 /* 内核侧页分配（方案：影子页/status 页下沉，消掉目标 maps 里的 2 条匿名 VMA）。
  * GFP_KERNEL=0xcc0：与 wxshadow 同生态实测值（__get_free_pages 的 flags 是
  * 数值宏，不在 kallsyms 里，只能取经验值——wxshadow 在同类内核上用同一个数）。 */
@@ -132,7 +150,7 @@ static u64 g_stub_onload;      /* stub=1：加载即装桩（跳过 INJ_REQ 握�
  * 零足迹）；影子路线做"改行为"。理由是报告区在受管页内会矛盾——SHADOW 视图下
  * 该页 EL0 无数据访问，桩的 str 要么 fault、要么（翻到 STEP 后）写进原页污染
  * 代码段、破坏 CRC 自检。 */
-#define CAOIN_MAX_ARGS 8
+#define CAOIN_MAX_ARGS 31       /* x0..x30（x31 是 SP，桩在 EL0 改它太危险，不做） */
 static u64 g_args[CAOIN_MAX_ARGS];
 static int g_has_arg[CAOIN_MAX_ARGS];
 static int g_nargs_installed;
@@ -273,8 +291,11 @@ static void caoin_sync_after_flip(void); /* 保留:占位 */
  * 用来重定位被入口桩覆盖的 4 条序言指令 —— 这是"记录+透传桩"能跑真实函数的
  * 前提（原版不做重定位，所以 README 说"目标函数须为寄存器运算型"）。 */
 #define CAOIN_OFF_HANDLER  0x800UL
-#define CAOIN_OFF_TRAMP    0x900UL
+#define CAOIN_OFF_TRAMP    0xA00UL
 #define CAOIN_OFF_REPORT   0xF00UL
+/* handler 区 0x800..0xA00 = 128 条指令（31 个寄存器全给满、每个最多 4 条
+ * movz/movk 也装得下；跳高位的 movk 会被跳过，实际远小于 128） */
+#define CAOIN_HANDLER_INSN_MAX 128
 extern unsigned long caoin_reloc_block(u32 *dst, unsigned long dst_addr,
                                        const u32 *src, unsigned long src_addr,
                                        int out_status[4]);
@@ -459,6 +480,38 @@ static void before_page_fault(hook_fargs3_t *args, void *udata)
         if (!kfn_probe_read(&req, (void *)slot, 8) && req == INJ_REQ
             && caoin_is_target_proc())
             inj_armed = 1;
+    }
+
+    /* ---- 自愈（路线 1）：限频重查受管 VA 的 PTE ----
+     * mprotect / madvise(DONTNEED) / 页回收都会用 VMA 的 vm_page_prot 重写或
+     * zap 受管页 PTE → 影子 PFN 被覆盖回原页 → 桩静默失效。失效后受管页变成
+     * 可读可执行，**从此不再 fault** → handler 无从察觉，hook 一去不回。
+     * 所以检查必须挂在目标进程的**任意** fault 上（这里），且限频。
+     *
+     * 判据（关键）：只有【cur_view == SHADOW 但 PTE 的 PFN 不是影子页】才算
+     * 漂移 → 重写影子 PTE。注意 STEP 视图下 PTE 本来就是原页（合法状态），
+     * 不能据此重 arm，否则会打断正常的跷跷板。 */
+    if (g_rearm_on && vbar_on && hooks_n && regs && caoin_is_target_proc()
+        && (g_rearm_tick++ & CAOIN_REARM_MASK) == 0) {
+        for (i = 0; i < hooks_n; i++) {
+            struct caoin_hook *h = &hooks[i];
+            unsigned long wa = 0, wv = 0;
+
+            if (h->cur_view != VIEW_SHADOW)
+                continue;                 /* STEP/OFF 是合法状态，不动 */
+            if (!caoin_walk_pgd_via_mm(h->tva, &wa)
+                || kfn_probe_read(&wv, (void *)wa, 8))
+                continue;
+            if ((wv & CAOIN_PFN_MASK) == (h->shadow_pte_val & CAOIN_PFN_MASK))
+                continue;                 /* 仍是影子页，未漂移 ✓ */
+
+            /* 视图说 SHADOW 但 PTE 不是影子页 → 被外部改写 → 重 arm */
+            caoin_set_pte((u64 *)wa, h->shadow_pte_val);
+            caoin_tlb_flush(0);
+            g_rearm_cnt++;
+            CK_ERR("caoin-kpm: re-arm hook%d pte %lx -> %lx (view=SHADOW)\n",
+                   i, wv, (unsigned long)h->shadow_pte_val);
+        }
     }
 
     handled = caoin_fault_check(addr, regs, esr);
@@ -973,11 +1026,19 @@ static void parse_args(const char *args)
         else if (!strncmp(p, "verbose=", 8)) g_verbose = parse_hex(p + 8);
         else if (!strncmp(p, "stub=", 5)) g_stub_onload = parse_hex(p + 5);
         else if (!strncmp(p, "stubmode=", 9)) stub_mode = (int)parse_hex(p + 9);
-        else if (!strncmp(p, "arg", 3) && p[3] >= '0'
-                 && p[3] < '0' + CAOIN_MAX_ARGS && p[4] == '=') {
+        else if (!strncmp(p, "rearm=", 6)) g_rearm_on = parse_hex(p + 6);
+        else if (!strncmp(p, "arg", 3) && p[3] >= '0' && p[3] <= '9') {
+            /* argN=，N 支持 1~2 位（arg0..arg30） */
+            const char *q = p + 4;
             int ai = p[3] - '0';
-            g_args[ai] = parse_hex(p + 5);
-            g_has_arg[ai] = 1;
+            if (*q >= '0' && *q <= '9') {
+                ai = ai * 10 + (*q - '0');
+                q++;
+            }
+            if (*q == '=' && ai < CAOIN_MAX_ARGS) {
+                g_args[ai] = parse_hex(q + 1);
+                g_has_arg[ai] = 1;
+            }
         }
         else if (!strncmp(p, "tva=", 4)) hooks[0].tva = parse_hex(p + 4);
         else if (!strncmp(p, "shva=", 5)) hooks[0].shva = parse_hex(p + 5);
@@ -1157,9 +1218,10 @@ static long caoin_restore(void)
     /* 并发插桩收尾：卸载时无条件打一次（不依赖 ctl0）。
      * overlap > 0 且 desync_a/b == 0 → 并发进入确实发生过、且没脱同步。 */
     CK_ERR("caoin-kpm: conc entries=%llu overlap=%llu desync_a=%llu desync_b=%llu "
-           "selfread_ok=%llu fb=%llu\n",
+           "rearm_on=%llu rearm_cnt=%llu selfread_ok=%llu fb=%llu\n",
            (unsigned long long)g_entries, (unsigned long long)g_overlap,
            (unsigned long long)g_desync_a, (unsigned long long)g_desync_b,
+           (unsigned long long)g_rearm_on, (unsigned long long)g_rearm_cnt,
            (unsigned long long)selfread_ok_cnt,
            (unsigned long long)selfread_fb_cnt);
     CK_LOG("caoin-kpm: off, restored (%d hooks)\n", hooks_n);
@@ -1269,7 +1331,6 @@ static void caoin_install_recstub(int hi)
     unsigned long skva, okva, orig_pfn, off, page_va, n;
     u32 orig[4];
     int st[4], i;
-    u32 *dst;
 
     skva = caoin_shadow_kva(h);
     if (!skva) {
@@ -1320,25 +1381,34 @@ static void caoin_install_recstub(int hi)
         return;
     }
 
-    /* 2) 入口桩（3 条，adrp+add+br，不读内存） */
-    caoin_make_entry_stub((u32 *)(skva + off), CAOIN_OFF_HANDLER);
-
-    /* 3) handler：可选地把 x0 改成 arg0，然后跳 trampoline。
-     * 刻意不写任何内存（报告区方案已弃用，理由见 g_arg0 的注释）。 */
-    dst = (u32 *)(skva + CAOIN_OFF_HANDLER);
+    /* 2) 先把 handler 构建到局部缓冲（含空间守卫），**通过之后才写入口桩**。
+     * 顺序很重要：入口桩先落盘而 handler 溢出的话，桩会跳进半写的 handler → 崩。 */
     {
+        u32 hbuf[CAOIN_HANDLER_INSN_MAX];
         unsigned long tramp = page_va + CAOIN_OFF_TRAMP;
         unsigned long hva   = page_va + CAOIN_OFF_HANDLER;
         long d;
-        int nh = 0, ai, nargs = 0;
+        int nh = 0, ai, nargs = 0, k;
 
         for (ai = 0; ai < CAOIN_MAX_ARGS; ai++)
             if (g_has_arg[ai]) {
-                nh += caoin_emit_movx(&dst[nh], ai, g_args[ai]);
+                if (nh + 4 + 1 > CAOIN_HANDLER_INSN_MAX) {
+                    CK_ERR("caoin-kpm: hook%d recstub: handler overflow "
+                           "(args too many/large) -> abort, nothing installed\n",
+                           hi);
+                    return;     /* 什么都没写，影子页仍是原页忠实副本 ✓ */
+                }
+                nh += caoin_emit_movx(&hbuf[nh], ai, g_args[ai]);
                 nargs++;
             }
         d = (long)((tramp - (hva + (unsigned long)nh * 4)) >> 2);
-        dst[nh++] = 0x14000000u | ((u32)d & 0x03FFFFFFu);                  /* b trampoline */
+        hbuf[nh++] = 0x14000000u | ((u32)d & 0x03FFFFFFu);   /* b trampoline */
+
+        /* 3) 入口桩（3 条，adrp+add+br，不读内存）+ handler 落盘 */
+        caoin_make_entry_stub((u32 *)(skva + off), CAOIN_OFF_HANDLER);
+        for (k = 0; k < nh; k++)
+            *(volatile u32 *)(skva + CAOIN_OFF_HANDLER + (unsigned long)k * 4)
+                = hbuf[k];
         g_nargs_installed = nargs;
     }
 
