@@ -19,7 +19,7 @@
 - [x] **P3-v5（参数观察，2026-10-15）**：硬件断点 KPM（`caoin_ko/caoin_hw.c`，构建产物 `caoin-hw.kpm`）——借鉴 kern/Hook 的 hw_hook 思路重写：直写 DBGBVR/BCR/WVR/WCR + hook 4.9 的 breakpoint_handler/single_step_handler/watchpoint_handler + `__switch_to` per-CPU 编程 + 单步恢复协议；**真机验证通过**（断点命中+寄存器改写+单步恢复+干净卸载+压力回归，见下节）
 - [x] **app 域注入实战（2026-10-15）**：真实用户 app（untrusted_app 域）上跑通完整注入链路——root ptrace app + memfd 隐匿加载 agent + 用户态 inline hook + 日志回传；**顺带修一处特征泄露**（trampoline memfd 名 "caoin" → "jit-cache"）。实测见下节。
 - [x] **ll 壳双层检测对抗实测（2026-10-15）**：自建检测样本（代码段 CRC 自检 + maps 扫描 + TracerPid），对照 caoin 两条路线。**结论：agent（inline hook）过不了 CRC 自检（改字节）、maps 暴露；KPM shadow 双层全过**（CRC 不破 + maps 干净 + 桩生效）。修正原论断（"agent memfd = 完整解"不成立）。见下节。
-- [x] **P3-v6（2026-10-15~16）**：自指读软件模拟（D）**解掉独占页约束**；影子页/status 页下沉内核分配（**目标 maps 零足迹**）；recstub 接重定位器（**能 hook 真实函数**）+ `argN=` 覆盖 x0..x30；并发 TLB 陈旧两处修复（不 engage + 一 engage 就活锁）；并发插桩（entries/overlap/desync）。**能力边界修正：`mprotect`/`madvise` 无解（自愈实测失败）**
+- [x] **P3-v6（2026-10-15~16）**：自指读软件模拟（D）**解掉独占页约束**；影子页/status 页下沉内核分配（**目标 maps 零足迹**）；recstub 接重定位器（**能 hook 真实函数**）+ `argN=` 覆盖 x0..x30；并发 TLB 陈旧两处修复（不 engage + 一 engage 就活锁）；并发插桩（entries/overlap/desync）。**能力边界实测修正：`mprotect` 保留 PFN 只重写权限位（SHADOW 态→读隐藏破；STEP 态→桩静默死），`madvise` 才回原页；自愈救不回**
 - [ ] 后置：Java 层下沉的 ArtMethod 全覆盖；更强反调试（信号/时序类）对抗
 
 ## P3-v6（2026-10-15 ~ 16）：自指活锁定位 → 内核页下沉 → 重定位桩 → 并发 TLB 修复
@@ -115,22 +115,47 @@ shva+0xA00  trampoline（重定位后的 4 条序言 + 尾桩跳回 tva+off+16�
 （另注：本轮之前的一次"多线程测试通过"结论**作废**——`-O2` 把 `st_hooked(0)` 当纯函数死代码删了，
 线程只读不取指，测试是空跑。已用 `volatile` 函数指针修正。）
 
-### 5. 能力边界修正：`mprotect` / `madvise` 无解（自愈实测失败）
+### 5. 能力边界修正：`mprotect` / `madvise` 的真实作用（实测，并修正本节初稿的错误）
 
 对照公开的 ACE（腾讯反作弊）字节级逆向笔记：ACE 的扫描器会**把 r-xp 页 `mprotect` 成 RWX 再 CRC**
-—— 也就是**反作弊的例行扫描本身就会把这类 hook 清掉**。于是专门测了这条：
+—— 也就是**反作弊的例行扫描本身就会把这类 hook 清掉**。于是专门测了这条。
 
-- 测试格子 C7：对受管页做 `mprotect(RX)`（同权限 → 内核 no-op）与 `madvise(MADV_DONTNEED)`
-  （zap PTE，下次访问按 VMA 重建）。
-- 实测：`madvise` 之后桩**静默失效**（`hooked` 从 777 掉回原值，caoin 无任何察觉）。
+**本节初稿写错了**：原以为 `mprotect` 是"用 VMA 的 vm_page_prot 重刷 PTE → 影子 PFN 被覆盖回原页"，
+即把 hook 打回原页。**实测不是这样**。用 `tests/selfread.c` mode 7 拆开量（`/proc/self/pagemap`
+直读 PTE 的 PFN，页外读受管页拿校验和判"读隐藏是否破"）：
+
+- **`mprotect` 保留 PFN，只重写属性位**。`change_protection_range` 逐条走 `pte_modify`，
+  而 `pte_modify` 的掩码里**不含 PFN 位** —— 它把**当前那个 PFN** 按 VMA 的新权限重新描述一遍，
+  并不"换回原页"。实测：`kshadow pfn=196bff` / `orig pfn=17a908`，`mprotect(RWX)` → `mprotect(RX)`
+  前后 `pagemap` 读到的 PFN **一直不变**。
+- 后果因此**取决于跷跷板当时停在哪一态**（A/B 对照，同一目标同一 hook 点）：
+
+  | mprotect 时页所在态 | PTE 结果 | 实测表现 |
+  |---|---|---|
+  | **SHADOW**（PFN=影子页, execute-only） | 影子页 + 新权限 → 失去 execute-only，变成 EL0 可读 | 桩仍生效（`hooked=777` 连轮稳定），但**读隐藏破**：页外读受管页拿到的是**影子页**内容（`rd_eq_base=0`，校验和含 0x40 的桩）→ CRC 自检即可发现 |
+  | **STEP**（PFN=原页, UXN=1） | 原页 + 新权限 → 变成**可执行** | **桩静默失效且永久不恢复**：`hooked` 从 777 掉回 `3n+7`，`pagemap` 显示页停在原页 PFN，之后每轮都是原返回值 |
+
+  对照是干净的：C7 若在 mprotect 前不读页（页停在 SHADOW）→ 连轮 `hooked=777`；
+  一旦先读一次把页翻到 STEP 再 mprotect → 桩**立即死且不再回来**（r=18 活、r=19 起恒为原值）。
+  所以"目标周期性 mprotect 自己代码页"确实能打死 hook，但机制是**STEP 态被改成可执行**，
+  不是"回到原页"。
+- **同权限 `mprotect` 是内核早退**：`mprotect_fixup` 在 `newflags == vma->vm_flags` 时直接返回，
+  连 `change_protection` 都进不去 → PTE 一个 bit 都不动。（此条为内核源码推演，实测无法与
+  "重跑一遍同样的权限"区分，故标注为未直接验证。）
+- **`madvise(MADV_DONTNEED)` 才是"回到原页"**：zap PTE，下次访问由**原生**缺页路径按 VMA 重建
+  → 桩静默失效。
 - **自愈尝试失败**：在目标进程的任意 fault 上限频重 walk 受管 PTE、发现漂移就重写影子值
   —— 自愈**确实触发**（日志 `re-arm hook0 pte 0 -> <shadow>`），但**取指仍然 translation fault**：
   `madvise` 拆的是**页表结构**而不是单个 PTE 值，重写落空。
-  **结论：页表类状态方案对 `mprotect`/`madvise` 无解**（与 wxshadow、UXN 同病；
-  UXN 的 README 自己就承认 `mprotect` 让它失效）。
 
-**修正后的路线定位**：改行为走 shadow（零足迹、过 CRC、不抗页表改写）；观察走 caoin-hw
-（DBG 寄存器不在页表里，天然免疫 `mprotect`）；对抗页表改写类检测无解。
+**回答"mprotect 是不是最高权限"**：在 guest 内核内是的 —— `mprotect` 是 EL1 的页表操作，
+PTE 里的 AP/UXN 只约束 **EL0**，对内核改页表没有任何约束力，所以 caoin 在 EL0 层面
+（execute-only 影子页）做不出任何抵抗。要抗只有一条路：在 EL1 hook 内核的
+`change_protection`/`mprotect_fixup` 去事后重写 PTE —— 那是"主动瘫痪对方的页表维护"，
+性质变了，本仓库不做。
+
+**修正后的路线定位**：改行为走 shadow（零足迹、过 CRC，但**不抗页表改写**）；观察走 caoin-hw
+（DBG 寄存器不在页表里，天然免疫 `mprotect`）；对抗页表改写类检测无解（与 wxshadow、UXN 同病）。
 
 ## P3-v5 硬件断点模块（caoin-hw，2026-10-15 真机验证通过）
 

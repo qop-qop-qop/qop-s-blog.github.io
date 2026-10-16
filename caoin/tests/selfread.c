@@ -96,8 +96,10 @@ extern int pthread_create(unsigned long *th, const void *attr,
                           void *(*fn)(void *), void *arg);
 extern int mprotect(void *addr, unsigned long len, int prot);
 extern int madvise(void *addr, unsigned long len, int advice);
+extern long lseek(int, long, int);
 
 #define SR_PROT_RX      5   /* PROT_READ | PROT_EXEC */
+#define SR_PROT_RWX     7   /* PROT_READ | PROT_WRITE | PROT_EXEC */
 #define SR_MADV_DONTNEED 4
 
 /* ---- 受管页布局 ---- */
@@ -242,6 +244,27 @@ static unsigned long page_of(unsigned long a)
     return a & ~0xFFFUL;
 }
 
+/* 直接读 /proc/self/pagemap 拿当前 PTE 的物理页号。
+ * 目的：mprotect 到底"改了什么"——是换了 PFN（回到原页），还是只重写了权限位。
+ * 目标以 root 跑，pagemap 的 PFN 字段对 CAP_SYS_ADMIN 可见。 */
+static unsigned long pgmap_pfn(unsigned long va)
+{
+    int fd = open("/proc/self/pagemap", 0);
+    unsigned long e = 0;
+    if (fd < 0)
+        return 0;
+    if (lseek(fd, (long)((va >> 12) * 8), 0) < 0) {
+        close(fd);
+        return 0;
+    }
+    if (read(fd, &e, 8) != 8) {
+        close(fd);
+        return 0;
+    }
+    close(fd);
+    return e & ((1UL << 55) - 1);
+}
+
 /* 运行模式：每轮重读，可随时切换（'1'/'2'/'3' 单选某格，其它 = 全跑）。
  * 存在的意义：C3 活锁会瞬间吃光 caoin 的 flt 日志上限（100 条），
  * 用 mode=2 才能拿到不含活锁的干净 dmesg 窗口去抓 EL1 那条线。 */
@@ -254,7 +277,7 @@ static int read_mode(void)
     if (read(fd, &b, 1) != 1)
         b = 0;
     close(fd);
-    if (b >= '1' && b <= '7')
+    if (b >= '1' && b <= '8')
         return (int)(b - '0');
     return 0;
 }
@@ -431,22 +454,55 @@ void _start(void)
             out_str("\n");
         }
 
-        /* C7（mode=7）：mprotect / madvise 自检 —— 反作弊的"免费一枪"。
-         * mprotect 会用 VMA 的 vm_page_prot 重刷 PTE；madvise(MADV_DONTNEED)
-         * 直接 zap PTE、下次访问由**原生**缺页路径按 VMA 重建。两者都会把影子页
-         * 的 PTE 覆盖掉 → 桩静默失效（caoin 的 cur_view 还停在 SHADOW，无任何察觉）。
-         * 注意：**同权限的 mprotect 是 no-op**（内核早退），所以 mp_hooked 预期不变；
-         * 真正生效的是 madvise 那一步。 */
-        if (mode == 7 && (round % 8) == 0) {
-            int rc1, rc2;
+        /* C7（mode=7）：只做 mprotect，每轮都做，用来拿"桩还活着"时的样本。
+         *
+         * 关键机制：mprotect 走 change_protection 时只重写 PTE 的**属性位**
+         * （pte_modify 的掩码里不含 PFN 位），PFN 原样保留。所以它既不"回到
+         * 原页"，也不认 caoin 的 cur_view —— 它只是把**当前那个 PFN** 按 VMA
+         * 新权限重新描述一遍。后果取决于跷跷板当时停在哪一态：
+         *   SHADOW（PFN=影子页, execute-only）→ 变成 EL0 可读 → 读隐藏破
+         *                                      （CRC 能读到桩字节）
+         *   STEP  （PFN=原页,    UXN=1）      → 变成可执行 → 从此不再 fault
+         *                                      → 桩彻底失效且无从察觉
+         * 同权限 mprotect（VMA 已是 r-x 再要 r-x）会被 mprotect_fixup 早退，
+         * 连 change_protection 都进不去 → PTE 一个 bit 都不动。 */
+        if (mode == 7) {
+            int rc;
             out_str("C7 r="); out_int(round);
+            /* 先读一次受管页：页外读触发 SHADOW→STEP，让后面的 mprotect
+             * 落在 **STEP 态**（PFN=原页、UXN=1）上 —— 这才是最危险的那种。 */
+            out_str(" rd0="); out_int(st_reader_outpage(mp, RD_N) == base_out);
+            out_str(" pfnA="); out_hex(pgmap_pfn((unsigned long)mp));
+
+            rc = mprotect((void *)mp, 4096, SR_PROT_RWX);      /* 改权限 */
+            out_str(" | rwx rc="); out_int(rc);
+            out_str(" pfn="); out_hex(pgmap_pfn((unsigned long)mp));
+            out_str(" hooked="); out_int(st_hooked(round));
+
+            rc = mprotect((void *)mp, 4096, SR_PROT_RX);       /* 还原 */
+            out_str(" | rx rc="); out_int(rc);
+            out_str(" pfn="); out_hex(pgmap_pfn((unsigned long)mp));
+            out_str(" hooked="); out_int(st_hooked(round));
+            /* 直判：mprotect 之后从页外**读**受管页，校验和是否仍等于原页。
+             * =1 → PTE 仍拒绝 EL0 数据访问（读被 caoin 翻 STEP 后拿原页）
+             * =0 → PTE 已变可读，读到的是影子页（含桩）→ 读隐藏已破 */
+            out_str(" rd_eq_base=");
+            out_int(st_reader_outpage(mp, RD_N) == base_out);
+            out_str("\n");
+        }
+
+        /* C8（mode=8）：madvise(DONTNEED) —— 真正 zap PTE，下次访问由原生缺页
+         * 路径按 VMA 重建 → 这才是"回到原页"，桩必然失效。 */
+        if (mode == 8) {
+            int rc;
+            out_str("C8 r="); out_int(round);
             out_str(" pre="); out_int(st_hooked(round));
-            rc1 = mprotect((void *)mp, 4096, SR_PROT_RX);
-            out_str(" mp_rc="); out_int(rc1);
-            out_str(" mp_hooked="); out_int(st_hooked(round));
-            rc2 = madvise((void *)mp, 4096, SR_MADV_DONTNEED);
-            out_str(" madv_rc="); out_int(rc2);
-            out_str(" madv_hooked="); out_int(st_hooked(round));
+            out_str(" pfn0="); out_hex(pgmap_pfn((unsigned long)mp));
+
+            rc = madvise((void *)mp, 4096, SR_MADV_DONTNEED);
+            out_str(" | madv rc="); out_int(rc);
+            out_str(" hooked="); out_int(st_hooked(round));
+            out_str(" pfn="); out_hex(pgmap_pfn((unsigned long)mp));
             out_str("\n");
         }
 

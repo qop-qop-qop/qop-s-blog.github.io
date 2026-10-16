@@ -109,7 +109,7 @@ kpatch su kpm load caoin-hw.kpm "verbose=1;add <pid> <addr> if x1=5"   # 条件�
 
 | 约束 | 原因 | 影响 |
 |---|---|---|
-| **`mprotect`/`madvise` 让 KPM shadow 静默失效** | 影子页的状态（影子 PFN + execute-only 权限）**存在 PTE 里**；内核对页表的任何合法操作——VMA 权限重刷（`mprotect`）、`zap_page_range`（`madvise(MADV_DONTNEED)`）、页回收——都会覆盖它 | 目标周期性 `mprotect` 自己代码页即可让 hook 失效，**且无任何报错**（受管页变回可读可执行 → 从此不再 fault → handler 无从察觉）。自愈（重写影子 PTE）实测**救不回**：页表结构已被拆，重写落空 |
+| **`mprotect`/`madvise` 改写受管页 PTE** | caoin 的状态（影子 PFN + execute-only 权限）只存在 PTE 里，而 `mprotect`/`madvise` 是**内核（EL1）**在改页表——PTE 的 AP/UXN 位只约束 EL0，对内核没有任何约束力。且 `mprotect` **保留 PFN、只重写权限位**（不是"把原页换回来"） | 实测（`selfread` mode 7）：`mprotect` 后影子页 PFN 不变，但后果取决于跷跷板当时停在哪一态——**SHADOW 态 → 影子页失去 execute-only、变成 EL0 可读 → 读隐藏破**（目标能读到桩字节，CRC 自检即可发现；实测 `rd_eq_base=0`）；**STEP 态 → 原页被改成可执行 → 桩静默失效且从此不再 fault**（实测桩立即变回原返回值并永久不再恢复）。`madvise(MADV_DONTNEED)` 则是 zap PTE、按 VMA 重建 → 回到原页、桩失效。同权限 `mprotect` 被内核早退、PTE 不动。自愈（重写影子 PTE）实测**救不回** |
 | **KPM shadow 并发下 TLB 抖动** | 每次视图切换会在别的核留下陈旧翻译，纠正一次 = 一次全量 `tlbi vmalle1is`（本机 `vaae1is` 在 fault 上下文活锁、`alle1is` panic，只剩全量可用） | 修复前实测 4 线程下 98% 的 handler 进入都在纠正陈旧 TLB，且**一 engage 就活锁**；修复（桩装完补 flush + 取指 permission fault 也纠正）后同一压测（4 线程 / 4.19e9 次迭代）取指纠正降到 1727 次、`bad=0`。低频调用场景可忽略 |
 | **agent 破 CRC 自检** | inline hook 必然改写目标函数字节 | 有完整性校验的目标不能用 agent |
 | **agent 短函数装不上** | 跳转桩需 ≥16 字节，而 bionic 大量函数是短系统调用包装（如 `getpid` ≈ 12B） | 需 PLT hook 等补充手段（当前未实现） |
@@ -135,7 +135,7 @@ kpatch su kpm load caoin-hw.kpm "verbose=1;add <pid> <addr> if x1=5"   # 条件�
 
 效果等价（都是"原页字节不变 + 执行重定向"）。**caoin 相对 wxshadow 的真正增量是**：内核态注入（无 ptrace 特征）、端到端工具链（符号解析 + 自动化）、自指读软件模拟（解掉独占页约束）、重定位桩（能 hook 真实函数），以及另外两条路线（用户态 agent、硬件断点）。
 
-**两者的共同边界**：状态都存在 PTE 里 → `mprotect` / `madvise` 会让 hook 静默失效。wxshadow 的 per-page PTE 锁解决的是**并发竞态**，解决不了"页表被内核合法改写"。
+**两者的共同边界**：状态都存在 PTE 里，而 PTE 的权限位只约束 EL0 → 内核（EL1）对页表的任何改写都无解。具体地，`mprotect` 保留 PFN 只重写权限位（SHADOW 态 → 读隐藏破；STEP 态 → 原页变可执行、桩静默死），`madvise(MADV_DONTNEED)` 则 zap 后按 VMA 重建（回到原页、桩失效）。wxshadow 的 per-page PTE 锁解决的是**并发竞态**，解决不了"页表被内核改写"。
 
 ## 项目结构
 
@@ -150,7 +150,7 @@ caoin/
 ├── cli/               # injector.c（ptrace 注入）/ prep.c（符号解析 + 页准备）
 ├── hook/              # ARM64 hook 原语（重定位、跳转桩）+ 主机端单测
 ├── tests/             # 测试目标与检测样本（target_dyn / shtarget / shellwatch / selfread / poke64）
-│                      #   selfread：7 格实验目标（自指读 / 页内读别页 / 跨页调用探针 / 改参数 / fork / 多线程 / mprotect）
+│                      #   selfread：8 格实验目标（自指读 / 页内读别页 / 跨页调用探针 / 改参数 / fork / 多线程 / mprotect / madvise）
 └── docs/DEVLOG.md     # 开发日志（实测记录、踩坑实录、路线演进）
 ```
 
