@@ -54,7 +54,10 @@ static int caoin_classify(u32 insn)
     if ((insn & 0x1F000000) == 0x10000000) return K_ADR;
     if ((insn & 0x7E000000) == 0x34000000) return K_CB;
     if ((insn & 0x7E000000) == 0x36000000) return K_TB;
-    if ((insn & 0x1F000000) == 0x18000000) return K_LIT;
+    /* bits[29:27]=011 + bits[25:24]=00（bit26=V 不参与）。
+     * 必须带 bit29：LDR/STR(register) 的 bits[29:27]=111，只掩 bits[28:24]
+     * 会把它们误判成 literal（旧掩码 0x1F000000 的 bug）。 */
+    if ((insn & 0x3B000000) == 0x18000000) return K_LIT;
     return K_OTHER;
 }
 
@@ -123,8 +126,27 @@ unsigned long caoin_reloc_block(u32 *dst, unsigned long dst_addr,
             }
             off = (s64)target - (s64)new_pc;
             if (!caoin_fit(off, -(1LL << 27), (1LL << 27) - 4)) {
-                out_status[i] = CAOIN_RELOC_RANGE;
-                return 0;
+                /* 超出 B 的 ±128MB：展开成 adrp x17, <target页> +
+                 * add x17, x17, #<页内偏移> + br x17（±4GB）。
+                 * 真机：status 页被挤到 258MB 外时 reloc 直接失败，
+                 * 桩装不上、capture 静默失效。x17(IP1) 在函数入口
+                 * 可安全用作跳板（ABI 调用者保存）。 */
+                unsigned long tp = target & ~0xFFFUL;
+                s64 pd = ((s64)tp - (s64)(dst_addr + n * 4)) >> 12;
+                u32 immlo, immhi;
+                if (n + 3 + 4 > CAOIN_TRAMP_CAP_INSN
+                    || !caoin_fit(pd, -(1LL << 20), (1LL << 20) - 1)) {
+                    out_status[i] = CAOIN_RELOC_RANGE;
+                    return 0;
+                }
+                immlo = (u32)(pd & 3);
+                immhi = (u32)((pd >> 2) & 0x7FFFF);
+                dst[n++] = 0x90000000u | (immlo << 29) | (immhi << 5) | 17;
+                dst[n++] = 0x91000000u
+                         | ((u32)(target & 0xFFF) << 10) | (17 << 5) | 17;
+                dst[n++] = 0xD61F0220u;   /* br x17 */
+                out_status[i] = CAOIN_RELOC_FIXED;
+                break;
             }
             dst[n++] = PUT_IMM26(insn, (u32)(off >> 2));
             out_status[i] = CAOIN_RELOC_FIXED;
@@ -213,7 +235,7 @@ unsigned long caoin_reloc_block(u32 *dst, unsigned long dst_addr,
     }
 
     /* 尾桩：跳回 src_addr + 16。
-     * 刻意不用 `LDR X16,#8; BR X16; <addr>`（原版 agent 的写法）——那个 literal
+     * 刻意不用 `LDR X16,#8; BR X16; <addr>`（旧的 LDR-literal 写法）——那个 literal
      * 就在受管页内，而 D 的自指读模拟是从**原页**读的（CRC 场景的正确语义），
      * 于是 LDR 会拿到原页的字节 = 垃圾地址 → BR 飞掉 → SIGSEGV（真机实测）。
      * 改成 adrp+add+br：三条、不读任何内存，绕开这个语义冲突。 */
@@ -230,6 +252,6 @@ unsigned long caoin_reloc_block(u32 *dst, unsigned long dst_addr,
     return n;
 }
 
-/* 注意：这里**不提供** caoin_make_entry_stub（原版 agent 的 `LDR X16,#8; BR X16;
+/* 注意：这里**不提供** caoin_make_entry_stub（旧的 `LDR X16,#8; BR X16;
  * <handler>` 写法）。它的 literal 在受管页内，与 D 的"从原页读"语义冲突 →
  * 拿到垃圾地址 → 崩。KPM 侧的入口桩改用 adrp+add+br，见 caoin_kpm.c。 */

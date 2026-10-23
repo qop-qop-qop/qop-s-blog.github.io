@@ -1,6 +1,6 @@
 /*
  * bionic 动态测试目标（无 NDK）：周期调用 caoin_target 并打印。
- * 注入 caoin_agent 后输出应从 base 变为 base+100（行为级证据）。
+ * hook caoin_target 后输出应从 base 变为 base+100（行为级证据）。
  * shadow 模式（argv[1]=="shadow"）：准备 shadow 页（快照+桩）并打印
  * caoin 内核模块所需的全部 cfg 值，之后进入 status 轮询 + 周期输出。
  */

@@ -1,5 +1,5 @@
 /*
- * caoin 平台抽象：libc（测试/CLI）与裸 syscall（agent, CAOIN_NOLIBC）双实现。
+ * caoin 平台抽象：libc（测试/CLI）与裸 syscall（CAOIN_NOLIBC）双实现。
  * MI 8 内核 4K 页；如目标设备 16K 页需改 CAOIN_PAGE 为运行时探测。
  */
 #ifndef CAOIN_PLATFORM_H

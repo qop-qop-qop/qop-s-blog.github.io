@@ -1,0 +1,387 @@
+#!/bin/sh
+# caoin — 统一命令行入口
+#
+# 子命令：
+#   caoin prep ...          符号解析 / 影子页准备（caoin_prep）
+#   caoin shadow run ...    prep + 装载 caoin-shadow.kpm（一条命令）
+#   caoin shadow load ...   直接装载（KPM 参数串原样透传）
+#   caoin shadow unload     卸载 caoin-shadow
+#   caoin hw ...            硬件断点 KPM（add / addw / load / unload）
+#   caoin build             主机侧构建（调用 build.sh）
+#   caoin doctor            环境自检
+#   caoin version           版本
+#
+# 环境变量：
+#   CAOIN_HOME     安装根目录（默认按脚本位置推断）
+#   CAOIN_BIN      工具目录（默认 build/ 或 PATH）
+#   CAOIN_KPM_DIR  KPM 文件目录
+#   CAOIN_KPATCH   kpatch 调用前缀（默认 "kpatch su"，可带参数）
+set -eu
+
+VERSION_FALLBACK=0.1.0
+PROG=caoin
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+
+# ---------- 路径推断 ----------
+self=$0
+case $self in
+    */*) ;;
+    *) self=$(command -v "$self" 2>/dev/null || printf '%s' "$0") ;;
+esac
+case $self in
+    */*) script_dir=$(cd "${self%/*}" && pwd) ;;
+    *)   script_dir=$(pwd) ;;
+esac
+
+if [ -n "${CAOIN_HOME:-}" ]; then
+    :
+elif [ -d "$script_dir/../share/caoin" ]; then
+    CAOIN_HOME=$(cd "$script_dir/../share/caoin" && pwd)
+elif [ -f "$script_dir/../VERSION" ]; then
+    CAOIN_HOME=$(cd "$script_dir/.." && pwd)
+else
+    CAOIN_HOME=$script_dir
+fi
+
+read_version() {
+    for f in "$CAOIN_HOME/VERSION" "$script_dir/../VERSION" "$script_dir/VERSION"; do
+        if [ -f "$f" ]; then
+            head -n 1 "$f"
+            return 0
+        fi
+    done
+    printf '%s\n' "$VERSION_FALLBACK"
+}
+
+find_tool() {
+    name=$1
+    if [ -n "${CAOIN_BIN:-}" ] && [ -f "$CAOIN_BIN/$name" ]; then
+        printf '%s/%s\n' "$(cd "$CAOIN_BIN" && pwd)" "$name"
+        return 0
+    fi
+    for d in "$script_dir" "$script_dir/../build" "$CAOIN_HOME/bin" "$CAOIN_HOME"; do
+        if [ -n "$d" ] && [ -f "$d/$name" ]; then
+            printf '%s/%s\n' "$(cd "$d" && pwd)" "$name"
+            return 0
+        fi
+    done
+    if command -v "$name" >/dev/null 2>&1; then
+        command -v "$name"
+        return 0
+    fi
+    return 1
+}
+
+find_kpm() {
+    name=$1
+    for d in "${CAOIN_KPM_DIR:-}" "$script_dir" "$script_dir/../build" \
+             "$CAOIN_HOME/kpm" "$CAOIN_HOME" "$PWD"; do
+        if [ -n "$d" ] && [ -f "$d/$name" ]; then
+            printf '%s\n' "$d/$name"
+            return 0
+        fi
+    done
+    return 1
+}
+
+run_kpatch() {
+    # CAOIN_KPATCH 允许带参数（"kpatch su"、"adb shell kpatch su"），
+    # 这里刻意不加引号，交给 shell 分词。
+    kp=${CAOIN_KPATCH:-kpatch su}
+    [ -n "$kp" ] || die "CAOIN_KPATCH 为空"
+    # shellcheck disable=SC2086
+    $kp "$@"
+}
+
+# ---------- 帮助 ----------
+usage() {
+    cat <<'EOF'
+caoin — Android arm64 无痕 hook 工具集
+
+用法:
+  caoin prep <pid> <module|@> <symbol|tva=0x..> [nommap|svaonly|hint=0x..]
+  caoin shadow run <pid> <module|@> <symbol|tva=0x..> [选项]
+  caoin shadow load "<pid=.. tva=.. ...>" [--kpm PATH] [--print]
+  caoin shadow unload
+  caoin hw add <pid> <addr> [xN=值]...
+  caoin hw addw <pid> <addr> <len>
+  caoin hw load "<命令;命令>"
+  caoin hw unload
+  caoin build
+  caoin doctor
+  caoin version
+
+shadow run 选项:
+  --nommap            影子页/status 页交给 KPM 内核分配（默认，全程不用 ptrace）
+  --mmap              回退到旧的远程 mmap 影子页/status 页路径（需要 ptrace）
+  --svaonly           只准备 status 页
+  --hint=0xADDR       status 页落位提示地址
+  --stub              装载后立即安装替换桩（stub=1）
+  --stubmode N        桩模式：1=直返  2=recstub（重定位+改参数）  3=capture
+  --polymorph         随机化入口桩寄存器/stub 返回值/status magic
+  --quiet             强制静默（默认已开）
+  --verbose           打开 KPM 日志（verbose=1 quiet=0）
+  --kpm-arg K=V       追加任意 KPM 参数（可重复）
+  --<key>=<value>     同上，直接透传（如 --arg0=0x64、--tva1=0x..）
+  --kpm PATH          指定 caoin-shadow.kpm
+  --kpatch CMD        指定 kpatch 调用前缀（默认 $CAOIN_KPATCH 或 "kpatch su"）
+  --print             只打印拼好的 KPM 参数串，不装载
+
+示例:
+  caoin shadow run 1234 libc.so open --stub --stubmode 2 --arg0=0x64
+  caoin shadow run 1234 libc.so open --mmap --stub        # 旧路径（ptrace）
+  caoin shadow run 1234 libc.so open --polymorph --stub
+  caoin shadow run 1234 @ 0x1234 --svaonly --print
+  caoin shadow load "pid=0x4d2 tva=0x7f01 shva=0x7f02 sva=0x7f03 stub=1"
+  caoin hw add 1234 0x7f00000000 x0=0x64
+EOF
+}
+
+# ---------- 子命令 ----------
+cmd_prep() {
+    tool=$(find_tool caoin_prep) || die "找不到 caoin_prep（设置 CAOIN_BIN 或先运行 caoin build）"
+    exec "$tool" "$@"
+}
+
+shadow_run() {
+    [ $# -ge 3 ] || die "用法: caoin shadow run <pid> <module|@> <symbol|tva=0x..> [选项]"
+
+    pid=$1 module=$2 symbol=$3
+    shift 3
+
+    prep_mode=nommap
+    extra=" quiet=1"
+    kpm_path=
+    print_only=0
+
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --nommap)   prep_mode=nommap ;;
+            --mmap|--remote-mmap) prep_mode= ;;
+            --svaonly)  prep_mode=svaonly ;;
+            --hint=*)   prep_mode=${1#--} ;;
+            --hint)     shift; [ $# -ge 1 ] || die "--hint 需要地址"; prep_mode="hint=$1" ;;
+            --stub)     extra="$extra stub=1" ;;
+            --stubmode) shift; [ $# -ge 1 ] || die "--stubmode 需要数字"; extra="$extra stubmode=$1" ;;
+            --verbose)  extra="$extra verbose=1 quiet=0" ;;
+            --polymorph) extra="$extra polymorph=1" ;;
+            --quiet)    extra="$extra quiet=1" ;;
+            --kpm-arg)  shift; [ $# -ge 1 ] || die "--kpm-arg 需要 key=value"; extra="$extra $1" ;;
+            --kpm=*)    kpm_path=${1#--kpm=} ;;
+            --kpm)      shift; [ $# -ge 1 ] || die "--kpm 需要路径"; kpm_path=$1 ;;
+            --kpatch)   shift; [ $# -ge 1 ] || die "--kpatch 需要命令"; CAOIN_KPATCH=$1 ;;
+            --print|--dry-run) print_only=1 ;;
+            --)         shift; while [ $# -gt 0 ]; do extra="$extra $1"; shift; done ;;
+            --*=*)      extra="$extra ${1#--}" ;;
+            -h|--help)  usage; return 0 ;;
+            *)          die "shadow run: 未知选项 $1" ;;
+        esac
+        shift
+    done
+
+    tool=$(find_tool caoin_prep) || die "找不到 caoin_prep（设置 CAOIN_BIN 或先运行 caoin build）"
+    if [ -n "$prep_mode" ]; then
+        out=$("$tool" "$pid" "$module" "$symbol" "$prep_mode")
+    else
+        out=$("$tool" "$pid" "$module" "$symbol")
+    fi
+    # prep 的日志走 stderr，stdout 只有一行 args；防御性取最后一行。
+    args=$(printf '%s\n' "$out" | tail -n 1)
+    [ -n "$args" ] || die "caoin_prep 没有输出参数串"
+    args=$args$extra
+
+    if [ "$print_only" -eq 1 ]; then
+        printf '%s\n' "$args"
+        return 0
+    fi
+
+    if [ -z "$kpm_path" ]; then
+        kpm_path=$(find_kpm caoin-shadow.kpm) || die "找不到 caoin-shadow.kpm（用 --kpm 指定，或设置 CAOIN_KPM_DIR）"
+    fi
+    run_kpatch kpm load "$kpm_path" "$args"
+}
+
+shadow_load() {
+    args=
+    kpm_path=
+    print_only=0
+
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --kpm=*)  kpm_path=${1#--kpm=} ;;
+            --kpm)    shift; [ $# -ge 1 ] || die "--kpm 需要路径"; kpm_path=$1 ;;
+            --kpatch) shift; [ $# -ge 1 ] || die "--kpatch 需要命令"; CAOIN_KPATCH=$1 ;;
+            --print)  print_only=1 ;;
+            -h|--help) usage; return 0 ;;
+            --)       shift; while [ $# -gt 0 ]; do args="$args $1"; shift; done ;;
+            *)        args="$args $1" ;;
+        esac
+        shift
+    done
+    args=${args# }
+
+    [ -n "$args" ] || die "shadow load: 需要 KPM 参数串"
+
+    if [ "$print_only" -eq 1 ]; then
+        printf '%s\n' "$args"
+        return 0
+    fi
+    if [ -z "$kpm_path" ]; then
+        kpm_path=$(find_kpm caoin-shadow.kpm) || die "找不到 caoin-shadow.kpm（用 --kpm 指定，或设置 CAOIN_KPM_DIR）"
+    fi
+    run_kpatch kpm load "$kpm_path" "$args"
+}
+
+shadow_unload() {
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --kpatch) shift; [ $# -ge 1 ] || die "--kpatch 需要命令"; CAOIN_KPATCH=$1 ;;
+            -h|--help) usage; return 0 ;;
+            *) die "shadow unload: 未知参数 $1" ;;
+        esac
+        shift
+    done
+    run_kpatch kpm unload caoin-shadow
+}
+
+cmd_shadow() {
+    [ $# -ge 1 ] || die "用法: caoin shadow <run|load|unload> ..."
+    sub=$1
+    shift
+    case $sub in
+        run)    shadow_run "$@" ;;
+        load)   shadow_load "$@" ;;
+        unload) shadow_unload "$@" ;;
+        -h|--help) usage ;;
+        *)      die "shadow: 未知子命令 $sub（run|load|unload）" ;;
+    esac
+}
+
+hw_load() {
+    args="$*"
+    [ -n "$args" ] || die "hw: 需要参数"
+    kpm=$(find_kpm caoin-hw.kpm) || die "找不到 caoin-hw.kpm（设置 CAOIN_KPM_DIR）"
+    run_kpatch kpm load "$kpm" "$args"
+}
+
+cmd_hw() {
+    [ $# -ge 1 ] || die "用法: caoin hw <add|addw|load|unload> ..."
+    sub=$1
+    shift
+    case $sub in
+        add)
+            [ $# -ge 2 ] || die "用法: caoin hw add <pid> <addr> [xN=值]..."
+            pid=$1 addr=$2
+            shift 2
+            spec="add $pid $addr"
+            for a in "$@"; do spec="$spec $a"; done
+            hw_load "$spec"
+            ;;
+        addw)
+            [ $# -ge 3 ] || die "用法: caoin hw addw <pid> <addr> <len>"
+            hw_load "addw $1 $2 $3"
+            ;;
+        load)
+            hw_load "$@"
+            ;;
+        unload)
+            while [ $# -gt 0 ]; do
+                case $1 in
+                    --kpatch) shift; [ $# -ge 1 ] || die "--kpatch 需要命令"; CAOIN_KPATCH=$1 ;;
+                    *) die "hw unload: 未知参数 $1" ;;
+                esac
+                shift
+            done
+            run_kpatch kpm unload caoin-hw
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            die "hw: 未知子命令 $sub（add|addw|load|unload）"
+            ;;
+    esac
+}
+
+cmd_build() {
+    if [ -f "$CAOIN_HOME/build.sh" ]; then
+        exec bash "$CAOIN_HOME/build.sh" "$@"
+    fi
+    if [ -f "$script_dir/../build.sh" ]; then
+        exec bash "$script_dir/../build.sh" "$@"
+    fi
+    die "找不到 build.sh"
+}
+
+cmd_doctor() {
+    printf 'caoin %s\n' "$(read_version)"
+    printf 'home: %s\n' "$CAOIN_HOME"
+    printf 'shell dir: %s\n' "$script_dir"
+
+    if p=$(find_tool caoin_prep); then
+        if [ -x "$p" ]; then
+            printf 'caoin_prep: %s\n' "$p"
+        else
+            printf 'caoin_prep: %s (not executable; chmod +x)\n' "$p"
+        fi
+    else
+        printf 'caoin_prep: MISSING\n'
+    fi
+
+    if command -v kpatch >/dev/null 2>&1; then
+        printf 'kpatch: %s\n' "$(command -v kpatch)"
+    else
+        printf 'kpatch: MISSING\n'
+    fi
+
+    for k in caoin-shadow.kpm caoin-hw.kpm; do
+        if p=$(find_kpm "$k"); then
+            printf '%s: %s\n' "$k" "$p"
+        else
+            printf '%s: MISSING\n' "$k"
+        fi
+    done
+
+    if command -v getprop >/dev/null 2>&1; then
+        abi=$(getprop ro.product.cpu.abi 2>/dev/null || true)
+        [ -n "$abi" ] && printf 'device abi: %s\n' "$abi"
+    fi
+}
+
+# ---------- 入口 ----------
+cmd=${1:-}
+if [ $# -gt 0 ]; then
+    shift
+fi
+
+case $cmd in
+    help|-h|--help)
+        usage
+        ;;
+    "")
+        usage >&2
+        exit 1
+        ;;
+    version|-V|--version)
+        printf 'caoin %s\n' "$(read_version)"
+        ;;
+    prep)
+        cmd_prep "$@"
+        ;;
+    shadow)
+        cmd_shadow "$@"
+        ;;
+    hw)
+        cmd_hw "$@"
+        ;;
+    build)
+        cmd_build "$@"
+        ;;
+    doctor)
+        cmd_doctor
+        ;;
+    *)
+        die "未知子命令: $cmd（caoin help）"
+        ;;
+esac

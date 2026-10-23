@@ -5,7 +5,7 @@
  *   ① 代码段 CRC 自检：定期算受管函数所在页的校验和（防 inline hook 改字节）
  *   ② maps 扫描：统计可执行映射数 + 找可疑项（/data/ 路径、/memfd: 映射）
  *   ③ TracerPid：读 /proc/self/status（防 ptrace 附加）
- * 循环调用受管函数并输出检测结果，供 caoin 各路线（shadow / agent）对照。
+ * 循环调用受管函数并输出检测结果，供 caoin 各路线对照。
  *
  * 受管函数独占页（页内偏移 64）——满足 caoin-shadow 的页级独占约束。
  *

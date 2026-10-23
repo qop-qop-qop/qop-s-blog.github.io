@@ -33,7 +33,10 @@ static int classify(uint32_t insn)
     if ((insn & 0x1F000000) == 0x10000000) return K_ADR;   /* bits[28:24]=10000，bit31 区分 ADR/ADRP */
     if ((insn & 0x7E000000) == 0x34000000) return K_CB;
     if ((insn & 0x7E000000) == 0x36000000) return K_TB;
-    if ((insn & 0x1F000000) == 0x18000000) return K_LIT;   /* bits[28:24]=11000，含 Wt/Xt/SWt/PRFM/St/Qt */
+    /* bits[29:27]=011 + bits[25:24]=00（bit26=V 不参与），含 Wt/Xt/SWt/PRFM/St/Qt。
+     * 必须带 bit29：LDR/STR(register) 的 bits[29:27]=111，只掩 bits[28:24]
+     * 会把它们误判成 literal → 重定位时按 imm19 读垃圾并改写指令字段。 */
+    if ((insn & 0x3B000000) == 0x18000000) return K_LIT;
     return K_OTHER;
 }
 
@@ -73,7 +76,7 @@ int caoin_window_pc_relative(const uint32_t *src)
         if ((insn & 0x1F000000) == 0x10000000) return 1;   /* ADR/ADRP */
         if ((insn & 0x7E000000) == 0x34000000) return 1;   /* CBZ/CBNZ */
         if ((insn & 0x7E000000) == 0x36000000) return 1;   /* TBZ/TBNZ */
-        if ((insn & 0x1F000000) == 0x18000000) return 1;   /* LDR literal */
+        if ((insn & 0x3B000000) == 0x18000000) return 1;   /* LDR literal（带 bit29，排除 LDR/STR register） */
     }
     return 0;
 }

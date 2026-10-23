@@ -14,8 +14,8 @@
  *   4. 远程 mmap status 页 → sva
  *   5. detach —— 运行期无 ptrace 痕迹（准备期痕迹可接受）
  *
- * 与 cli/injector.c 同源：静态 glibc，rd/wr_mem 走 /proc/pid/mem，
- * call_remote 走 ptrace 远程调用（aarch64 x0-x5，LR=0 捕获返回）。
+ * 实现：静态 glibc，rd/wr_mem 走 /proc/pid/mem，call_remote 走 ptrace
+ * 远程调用（aarch64 x0-x5，LR=0 捕获返回）。
  *
  * 限制：只能解析**动态符号**（DT_SYMTAB）。主程序 local 符号需 -rdynamic
  * 或目标为共享库（实战主场景：libc/libxxx.so 的导出符号）。
@@ -55,7 +55,14 @@ static void wr_mem(uintptr_t addr, const void *buf, size_t len)
 
 /* ---------- 模块基址（/proc/pid/maps） ---------- */
 
-/* name == "@" 时返回第一个文件映射（主程序，PIE 主程序总在最低地址） */
+/* 模块基址：优先用**可执行映射**反推（base = start - file_off）。
+ *
+ * 不能只看"第一个 off==0 的映射"：被保护的目标（FairGuard 加密的
+ * libil2cpp.so 实测）会额外映射一份只读全量视图，它在 maps 里可能排在
+ * 真正模块之前；只有 r-xp 那份才是被执行的。挂错那份 = hook 静默不生效。
+ *
+ * name == "@" 时取第一个文件映射对应的模块（PIE 主程序总在最低地址，
+ * 其 r-xp 段 offset 通常为 0x1000，反推后与 header 映射同址）。 */
 static uintptr_t find_module(pid_t pid, const char *name)
 {
     char path[64];
@@ -65,20 +72,88 @@ static uintptr_t find_module(pid_t pid, const char *name)
 
     int main_prog = (name[0] == '@');
     char line[512];
-    uintptr_t base = 0;
+    uintptr_t base = 0, fallback = 0;
     while (fgets(line, sizeof(line), f)) {
         uintptr_t start, end, off;
         char perms[8], dev[8], fpath[256] = "";
         int n = sscanf(line, "%lx-%lx %7s %lx %7s %*d %255s",
                        &start, &end, perms, &off, dev, fpath);
-        if (n < 5 || off != 0 || fpath[0] != '/') continue;
-        if (main_prog || strstr(fpath, name)) { base = start; break; }
+        if (n < 5 || fpath[0] != '/') continue;
+        if (!main_prog && !strstr(fpath, name)) continue;
+
+        if (perms[2] == 'x' && start >= off) {
+            base = start - off;
+            break;
+        }
+        if (!fallback && off == 0)
+            fallback = start;
     }
     fclose(f);
-    return base;
+    return base ? base : fallback;
 }
 
-/* ---------- 远程 ELF dynsym 解析（同 injector.c） ---------- */
+/* 在 center ±2GB 内找一个 >= len 的空洞（maps 已按地址排序）。
+ * 用于把 status/handler 页分配到受管页附近 —— 入口桩的 ADRP 只有 ±4GB，
+ * 而被重定位的 B/BL 只有 ±128MB。所以必须选**离 center 最近**的空洞，
+ * 不能返回扫描到的第一个（真机实测：第一个空洞在 -1.8GB，reloc 直接
+ * RANGE 失败，handler 装不上）。 */
+static uintptr_t find_free_near(pid_t pid, uintptr_t center, size_t len)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+
+    uintptr_t lo = center > (3UL << 30) ? center - (2UL << 30) : 0x10000UL;
+    uintptr_t hi = center + (2UL << 30);
+    uintptr_t cur = (lo + 0xFFF) & ~(uintptr_t)0xFFF;
+    uintptr_t best = 0, best_d = ~(uintptr_t)0;
+    char line[512];
+    int ngap = 0;
+
+    while (fgets(line, sizeof(line), f)) {
+        uintptr_t s, e;
+        if (sscanf(line, "%lx-%lx", &s, &e) != 2) continue;
+        if (e <= lo || s >= hi) continue;
+        if (s > cur) {
+            uintptr_t gap_end = s;
+            if (gap_end - cur >= len) {
+                /* 取空洞内离 center 最近的对齐地址 */
+                uintptr_t cand = cur;
+                if (center > cand) {
+                    uintptr_t near = center & ~(uintptr_t)0xFFF;
+                    if (near > cand && near + len <= gap_end)
+                        cand = near;
+                }
+                uintptr_t d = cand > center ? cand - center : center - cand;
+                ngap++;
+                if (d < best_d) { best_d = d; best = cand; }
+            }
+        }
+        if (e > cur) cur = e;
+    }
+    if (hi > cur && hi - cur >= len) {
+        uintptr_t cand = cur;
+        if (center > cand) {
+            uintptr_t near = center & ~(uintptr_t)0xFFF;
+            if (near > cand && near + len <= hi)
+                cand = near;
+        }
+        uintptr_t d = cand > center ? cand - center : center - cand;
+        ngap++;
+        if (d < best_d) { best_d = d; best = cand; }
+    }
+    fclose(f);
+    if (best)
+        LOG("free-near: %d gaps, best %llx (%.1f MB from center)",
+            ngap, (unsigned long long)best, (double)best_d / 1048576.0);
+    else
+        LOG("free-near: no gap >= %zu in +-2GB of %llx", len,
+            (unsigned long long)center);
+    return best;
+}
+
+/* ---------- 远程 ELF dynsym 解析 ---------- */
 
 static uint32_t gnu_hash_nsyms(uintptr_t gh_addr)
 {
@@ -195,7 +270,9 @@ static uintptr_t call_remote(pid_t pid, uintptr_t func, const uintptr_t args[6])
 
 static void usage(void)
 {
-    fprintf(stderr, "usage: caoin_prep <pid> <module_pat|@> <symbol> [nommap]\n"
+    fprintf(stderr, "usage: caoin_prep <pid> <module_pat|@> <symbol|tva=0x...> [nommap|hint=0x...]\n"
+                    "  tva=<hex>: 跳过符号解析，直接用给定地址（适用于符号被抹除的目标，\n"
+                    "             例如从 P/Invoke delegate 缓存读出的 luaL_loadbuffer 指针）\n"
                     "  nommap: 不远程 mmap 影子页/status 页（交给 KPM 内核分配），\n"
                     "          目标 maps 零新增 VMA，且全程不用 ptrace\n");
     exit(1);
@@ -207,25 +284,46 @@ int main(int argc, char **argv)
     pid_t pid = (pid_t)atoi(argv[1]);
     const char *module = argv[2];
     const char *symbol = argv[3];
+    uintptr_t hint_addr = 0;
+    int nommap = (argc > 4 && strcmp(argv[4], "nommap") == 0);
+
+    /* hint=<hex>: status/handler 页要分配在这个地址附近（受管页 VA），
+     * 保证入口桩 ADRP 能覆盖（±4GB）。 */
+    if (argc > 4 && strncmp(argv[4], "hint=", 5) == 0)
+        hint_addr = (uintptr_t)strtoull(argv[4] + 5, NULL, 16);
 
     char p[64];
     snprintf(p, sizeof(p), "/proc/%d/mem", pid);
-    g_memfd = open(p, O_RDWR);
+    /* nommap 只读：不远程 mmap、不写目标页，少一个 O_RDWR 足迹。 */
+    g_memfd = open(p, nommap ? O_RDONLY : O_RDWR);
     if (g_memfd < 0) DIE("open mem: %s", strerror(errno));
 
-    uintptr_t base = find_module(pid, module);
-    if (!base) DIE("module not found in maps: %s", module);
-    LOG("module base = %llx", (unsigned long long)base);
+    uintptr_t base = 0, tva = 0;
+    if (strncmp(symbol, "tva=", 4) == 0) {
+        tva = (uintptr_t)strtoull(symbol + 4, NULL, 16);
+        if (!tva)
+            DIE("bad tva in %s", symbol);
+        LOG("raw tva = %llx (symbol lookup skipped)", (unsigned long long)tva);
+    } else {
+        base = find_module(pid, module);
+        if (!base) DIE("module not found in maps: %s", module);
+        LOG("module base = %llx", (unsigned long long)base);
+    }
 
-    uintptr_t tva = remote_symbol(base, symbol);
-    if (!tva) DIE("symbol not found: %s", symbol);
-    LOG("symbol %s = %llx (page off %llx)", symbol,
+    if (!tva) {
+        tva = remote_symbol(base, symbol);
+        if (!tva) DIE("symbol not found: %s", symbol);
+    }
+    LOG("target %s = %llx (page off %llx)", symbol,
         (unsigned long long)tva, (unsigned long long)(tva & 0xFFF));
 
     /* nommap：影子页 + status 页都交给 KPM 在内核分配（args 里不给 shva/sva）。
      * 目标 maps 零新增 VMA，而且这条路径完全不用 ptrace——只读
      * /proc/pid/maps 与 /proc/pid/mem。 */
-    if (argc > 4 && strcmp(argv[4], "nommap") == 0) {
+    if (nommap) {
+        /* 注意：这里不要主动 pread 目标页。实测对正在执行的 file-backed
+         * 代码页做 GUP 预取会把目标卡在内核 fault 循环（SIGKILL 都杀不掉）。
+         * 目标页应由目标自己执行/访问而 fault-in；调用方需等它跑起来再挂。 */
         printf("pid=0x%x tva=0x%llx\n",
                (unsigned)pid, (unsigned long long)tva);
         LOG("nommap: KPM will allocate shadow+status pages in kernel");
@@ -243,22 +341,36 @@ int main(int argc, char **argv)
     waitpid(pid, &st, 0);
     get_regs(pid, &g_saved);
 
+    /* svaonly：只准备 status 页（handler/trampoline 的家），不读目标页。
+     * 用于"内核 shadow + 用户 status"配置；避免对正在执行的代码页做
+     * /proc/mem 预取（实测会把目标卡死）。 */
+    int svaonly = (argc > 4 && strcmp(argv[4], "svaonly") == 0);
+
     /* 远程 mmap 影子页 + status 页（RW 匿名） */
     uintptr_t a_sh[6] = { 0, 4096, PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANONYMOUS, (uintptr_t)-1, 0 };
-    uintptr_t shva = call_remote(pid, f_mmap, a_sh);
-    uintptr_t a_sv[6] = { 0, 4096, PROT_READ | PROT_WRITE,
-                          MAP_PRIVATE | MAP_ANONYMOUS, (uintptr_t)-1, 0 };
+    uintptr_t shva = svaonly ? 0 : call_remote(pid, f_mmap, a_sh);
+    /* status 页兼作 handler/trampoline 页：必须落在受管页 ±4GB 内（入口桩 ADRP）。
+     * 先在 tva 附近找空洞，用 MAP_FIXED 精确落位；找不到再退回任意地址。 */
+    uintptr_t sv_hint = find_free_near(pid, hint_addr ? hint_addr : tva, 4096);
+    uintptr_t a_sv[6] = { sv_hint, 4096, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS
+                              | (sv_hint ? MAP_FIXED : 0),
+                          (uintptr_t)-1, 0 };
     uintptr_t sva = call_remote(pid, f_mmap, a_sv);
-    if (shva == (uintptr_t)-1 || sva == (uintptr_t)-1)
+    if (sv_hint)
+        LOG("status page hint = %llx", (unsigned long long)sv_hint);
+    if ((!svaonly && shva == (uintptr_t)-1) || sva == (uintptr_t)-1)
         DIE("remote mmap failed (shva=%llx sva=%llx)",
             (unsigned long long)shva, (unsigned long long)sva);
 
-    /* 影子页 = 受管页原样快照（KPM 只在其上写桩） */
-    uintptr_t page = tva & ~0xFFFUL;
-    static unsigned char buf[4096];
-    rd_mem(page, buf, 4096);
-    wr_mem(shva, buf, 4096);
+    /* 影子页 = 受管页原样快照（KPM 只在其上写桩）；svaonly 跳过 */
+    if (!svaonly) {
+        uintptr_t page = tva & ~0xFFFUL;
+        static unsigned char buf[4096];
+        rd_mem(page, buf, 4096);
+        wr_mem(shva, buf, 4096);
+    }
 
     /* status 页 fault-in：KPM 经内核线性映射读它，未分配页（PTE 未 present）
      * 会让 KPM 的 PFN 推导失败（真机实证 "wstat slot unreadable"） */
