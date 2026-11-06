@@ -104,6 +104,7 @@ caoin — Android arm64 无痕 hook 工具集
   caoin shadow run <pid> <module|@> <symbol|tva=0x..> [选项]
   caoin shadow load "<pid=.. tva=.. ...>" [--kpm PATH] [--print]
   caoin shadow unload
+  caoin ctl "<ctl_args>" [outlen]    KPM ctl0 透传（dump/read/capinfo/status）
   caoin hw add <pid> <addr> [xN=值]...
   caoin hw addw <pid> <addr> <len>
   caoin hw load "<命令;命令>"
@@ -119,6 +120,13 @@ shadow run 选项:
   --hint=0xADDR       status 页落位提示地址
   --stub              装载后立即安装替换桩（stub=1）
   --stubmode N        桩模式：1=直返  2=recstub（重定位+改参数）  3=capture
+  --cow               装载后做 COW bake-in（旧 KPM 跨核可见性兜底；新 KPM 的
+                      per-CPU 懒安装已覆盖，一般不用）
+  --kalloc            无 ptrace：status/注入页由 KPM 在目标 fault 上下文
+                      vm_mmap 自建（prep 只读 maps/mem 解析 tva）
+  --inject "LUA"      前置注入：把这段 Lua 代码拼到每个 chunk 前面执行
+                      （需配合 --stub --stubmode 3；prep 自动用 inject 模式）
+  --inject-min N      只注入长度 >= N 的 buffer（默认 0x100，防递归）
   --polymorph         随机化入口桩寄存器/stub 返回值/status magic
   --quiet             强制静默（默认已开）
   --verbose           打开 KPM 日志（verbose=1 quiet=0）
@@ -127,6 +135,9 @@ shadow run 选项:
   --kpm PATH          指定 caoin-shadow.kpm
   --kpatch CMD        指定 kpatch 调用前缀（默认 $CAOIN_KPATCH 或 "kpatch su"）
   --print             只打印拼好的 KPM 参数串，不装载
+
+环境变量:
+  CAOIN_SUPERKEY      supercall 密钥（kpmctl 用，默认 "su"）
 
 示例:
   caoin shadow run 1234 libc.so open --stub --stubmode 2 --arg0=0x64
@@ -144,6 +155,14 @@ cmd_prep() {
     exec "$tool" "$@"
 }
 
+# KPM ctl0 透传：dump <off> <len> / read <va> <len> / capinfo / status
+# 本机 kpatch 精简版没有 ctl0 子命令，走 supercall（kpmctl）。
+cmd_ctl() {
+    [ $# -ge 1 ] || die "用法: caoin ctl \"<ctl_args>\" [outlen]"
+    tool=$(find_tool kpmctl) || die "找不到 kpmctl（设置 CAOIN_BIN 或先运行 caoin build）"
+    "$tool" "${CAOIN_SUPERKEY:-su}" caoin-shadow "$1" "${2:-65536}"
+}
+
 shadow_run() {
     [ $# -ge 3 ] || die "用法: caoin shadow run <pid> <module|@> <symbol|tva=0x..> [选项]"
 
@@ -154,6 +173,7 @@ shadow_run() {
     extra=" quiet=1"
     kpm_path=
     print_only=0
+    cow=0
 
     while [ $# -gt 0 ]; do
         case $1 in
@@ -164,6 +184,22 @@ shadow_run() {
             --hint)     shift; [ $# -ge 1 ] || die "--hint 需要地址"; prep_mode="hint=$1" ;;
             --stub)     extra="$extra stub=1" ;;
             --stubmode) shift; [ $# -ge 1 ] || die "--stubmode 需要数字"; extra="$extra stubmode=$1" ;;
+            --cow)      cow=1 ;;
+            --kalloc)   prep_mode=nommap; extra="$extra kalloc=1" ;;
+            --inject)   shift; [ $# -ge 1 ] || die "--inject 需要 Lua 代码"
+                        prep_mode=inject
+                        injhex=$(printf '%s' "$1" | od -An -tx1 | tr -d ' \n')
+                        [ -n "$injhex" ] || die "--inject: hex 编码失败"
+                        extra="$extra injhex=$injhex" ;;
+            --inject-min) shift; [ $# -ge 1 ] || die "--inject-min 需要数字"; extra="$extra injmin=$1" ;;
+            --inject-name) shift; [ $# -ge 1 ] || die "--inject-name 需要字符串"
+                        injname=$(printf '%s' "$1" | od -An -tx1 | tr -d ' \n')
+                        [ -n "$injname" ] || die "--inject-name: hex 编码失败"
+                        extra="$extra injname=$injname" ;;
+            --inject-find) shift; [ $# -ge 1 ] || die "--inject-find 需要字符串"
+                        injfind=$(printf '%s' "$1" | od -An -tx1 | tr -d ' \n')
+                        [ -n "$injfind" ] || die "--inject-find: hex 编码失败"
+                        extra="$extra injfind=$injfind" ;;
             --verbose)  extra="$extra verbose=1 quiet=0" ;;
             --polymorph) extra="$extra polymorph=1" ;;
             --quiet)    extra="$extra quiet=1" ;;
@@ -200,6 +236,28 @@ shadow_run() {
         kpm_path=$(find_kpm caoin-shadow.kpm) || die "找不到 caoin-shadow.kpm（用 --kpm 指定，或设置 CAOIN_KPM_DIR）"
     fi
     run_kpatch kpm load "$kpm_path" "$args"
+
+    # COW bake-in（可选）：装桩后读回影子页上的入口桩字节、原样写回受管 VA，
+    # 强制内核走原生 COW（换页 + flush_tlb_page）。用于旧 KPM 的跨核可见性
+    # 兜底；新 KPM 在 __switch_to 里做 per-CPU 懒安装，不再需要。
+    if [ "$cow" -eq 1 ]; then
+        tva=$(printf '%s\n' "$args" | sed -n 's/.*tva=\(0x[0-9a-fA-F]*\).*/\1/p')
+        if [ -z "$tva" ]; then
+            printf '%s: --cow 跳过（参数串里没有 tva）\n' "$PROG" >&2
+        else
+            kc=$(find_tool kpmctl) || die "找不到 kpmctl（--cow 需要，先运行 caoin build）"
+            if "$kc" cow "${CAOIN_SUPERKEY:-su}" caoin-shadow "$pid" "$tva"; then
+                printf '%s: COW bake-in ok (tva=%s)\n' "$PROG" "$tva"
+            else
+                rc=$?
+                printf '%s: COW bake-in 失败 rc=%s（桩未装或 VA 不对）\n' "$PROG" "$rc" >&2
+            fi
+        fi
+    fi
+
+    # 记录本次 prep 建的页地址，供 shadow unload 收尾 munmap
+    # （KPM 卸载不回收这些页，不清理会在目标 maps 留匿名 RW VMA）
+    printf '%s\n' "$args" > "${CAOIN_STATE:-/data/local/tmp/.caoin_state}" 2>/dev/null || true
 }
 
 shadow_load() {
@@ -242,7 +300,37 @@ shadow_unload() {
         esac
         shift
     done
+    # kalloc/status 页收尾：先 restore（KPM 不再使用 status 页）→ unmap
+    # （KPM 用 do_munmap 把目标 mm 里的页清掉，覆盖 kalloc 与 prep 两种来源）。
+    kc=$(find_tool kpmctl) 2>/dev/null || kc=
+    if [ -n "$kc" ]; then
+        "$kc" "${CAOIN_SUPERKEY:-su}" caoin-shadow "restore" 4096 >/dev/null 2>&1 || true
+        "$kc" "${CAOIN_SUPERKEY:-su}" caoin-shadow "unmap" 4096 >/dev/null 2>&1 || true
+    fi
     run_kpatch kpm unload caoin-shadow
+
+    # 收尾：munmap prep 建的页（status/shadow/inject）。KPM 卸载不回收它们，
+    # 不清理会在目标 maps 留匿名 RW VMA（无痕性）。地址来自 shadow run 记录的
+    # state 文件；目标已退出时 cleanup 自己会跳过（页随 mm 释放）。
+    state=${CAOIN_STATE:-/data/local/tmp/.caoin_state}
+    if [ -f "$state" ]; then
+        line=$(cat "$state" 2>/dev/null || true)
+        spid=$(printf '%s\n' "$line" | sed -n 's/.*pid=\(0x[0-9a-fA-F]*\).*/\1/p')
+        addrs=
+        for k in sva injva shva; do
+            v=$(printf '%s\n' "$line" | sed -n "s/.*$k=\(0x[0-9a-fA-F]*\).*/\1/p")
+            if [ -n "$v" ] && [ "$v" != "0x0" ]; then
+                addrs="$addrs $v"
+            fi
+        done
+        if [ -n "$spid" ] && [ -n "$addrs" ]; then
+            tool=$(find_tool caoin_prep) || die "找不到 caoin_prep（收尾需要）"
+            # shellcheck disable=SC2086
+            "$tool" cleanup "$((spid))" $addrs || \
+                printf '%s: cleanup 跳过（目标可能已退出）\n' "$PROG" >&2
+        fi
+        rm -f "$state" 2>/dev/null || true
+    fi
 }
 
 cmd_shadow() {
@@ -371,6 +459,9 @@ case $cmd in
         ;;
     shadow)
         cmd_shadow "$@"
+        ;;
+    ctl)
+        cmd_ctl "$@"
         ;;
     hw)
         cmd_hw "$@"

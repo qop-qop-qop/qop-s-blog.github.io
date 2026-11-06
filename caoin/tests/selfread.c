@@ -39,6 +39,11 @@
  *   echo 2 > /data/local/tmp/selfread.mode   # 只跑 C2（页内读别页）
  *   echo 3 > /data/local/tmp/selfread.mode   # 只跑 C3（页内读受管页）
  *   echo 4 > /data/local/tmp/selfread.mode   # 只跑 fork 压力（每轮 fork 一次）
+ *   echo a > /data/local/tmp/selfread.mode   # 只跑 C10（只读页写 → 期望 SIGSEGV）
+ *   echo b > /data/local/tmp/selfread.mode   # 只跑 C11（PROT_NONE 不绕过不活锁）
+ *   echo c > /data/local/tmp/selfread.mode   # 只跑 C12（只读页 DC/IC 代做跳过）
+ *   echo d > /data/local/tmp/selfread.mode   # 只跑 C13（/proc/self/mem GUP 读）
+ *   echo e > /data/local/tmp/selfread.mode   # 只跑 C14（munmap+mmap FIXED 感知，不碰页内容）
  *   rm /data/local/tmp/selfread.mode         # 三个都跑
  *   用途：C3 活锁会以极高频率刷 fault 日志，把 caoin 的 flt 日志上限（100 条）
  *   瞬间吃光，EL1 那条线就看不到窗口了。用 mode=2 可以拿到不含活锁的干净窗口。
@@ -96,11 +101,18 @@ extern int pthread_create(unsigned long *th, const void *attr,
                           void *(*fn)(void *), void *arg);
 extern int mprotect(void *addr, unsigned long len, int prot);
 extern int madvise(void *addr, unsigned long len, int advice);
+extern int munmap(void *addr, unsigned long len);
+extern long mmap(void *addr, unsigned long len, int prot, int flags,
+                 int fd, long off);
 extern long lseek(int, long, int);
+extern void (*signal(int, void (*)(int)))(int);
+extern long pread(int fd, void *buf, unsigned long n, long off);
 
+#define SR_PROT_NONE    0
 #define SR_PROT_RX      5   /* PROT_READ | PROT_EXEC */
 #define SR_PROT_RWX     7   /* PROT_READ | PROT_WRITE | PROT_EXEC */
 #define SR_MADV_DONTNEED 4
+#define SR_SIGSEGV      11
 
 /* ---- 受管页布局 ---- */
 asm(".pushsection .st.text, \"ax\"\n.balign 4096\n.fill 64, 1, 0\n.popsection");
@@ -113,6 +125,16 @@ __attribute__((noinline, used, visibility("default")))
 long st_helper(long x)
 {
     return x * 3 + 7;
+}
+
+/* C12：从页外对受管页做 cache 维护。只读页上 DC/IC 是 WnR=1 permission
+ * fault —— 新 handler 代做并跳过（不翻 STEP、不 SIGSEGV）。 */
+__attribute__((noinline, used, visibility("default")))
+long st_cacheop(volatile void *p)
+{
+    __asm__ volatile("dc cvac, %0" :: "r"(p) : "memory");
+    __asm__ volatile("ic ivau, %0" :: "r"(p) : "memory");
+    return 4321;
 }
 
 /* pc 重定向的目标（方案 A 的 trampoline）：返回一个一眼可辨的标记值 */
@@ -279,6 +301,8 @@ static int read_mode(void)
     close(fd);
     if (b >= '1' && b <= '9')
         return (int)(b - '0');
+    if (b >= 'a' && b <= 'e')
+        return 10 + (b - 'a');   /* 'a'..'e' = C10..C14 */
     return 0;
 }
 
@@ -325,6 +349,44 @@ static void *thr_race(void *arg)
     return (void *)0;
 }
 
+/* ---- C10/C11：fork 子进程探针 ----
+ * 只读页写 / PROT_NONE 访问的新 handler 语义是交还原生 → 子进程收 SIGSEGV。
+ * 用 fork 子进程做坏访问、父进程 waitpid 看死法：确定性，无信号处理陷阱
+ * （首版用 sigsetjmp(0)+handler 内 siglongjmp，第二次 SIGSEGV 没接住，
+ *  进程直接死——signal 掩码/内核信号状态不一致，弃用）。
+ * 顺带每格都过一遍 copy_process pause/resume 路径。 */
+static int probe_segv(long (*volatile fn)(long))
+{
+    int st = 0;
+    long cpid = fork();
+
+    if (cpid == 0)
+        _exit((int)fn(0));   /* 没崩 = 写/访问成功，退出码是返回值 */
+    if (cpid < 0)
+        return -1;
+    waitpid((int)cpid, &st, 0);
+    /* 被 SIGSEGV 杀死 = 1（期望）；正常退出 = 0（权限被绕过，BAD） */
+    return ((st & 0x7f) == SR_SIGSEGV) ? 1 : 0;
+}
+
+static volatile unsigned long g_mp;   /* 受管页地址（探针子进程用） */
+
+/* 探针包装（.text 页外）：坏写 / 坏读 */
+__attribute__((noinline, used, visibility("default")))
+long st_badwrite(long x)
+{
+    (void)x;
+    *(volatile unsigned long *)g_mp = 0x1234;
+    return 7777;
+}
+
+__attribute__((noinline, used, visibility("default")))
+long st_badread(long x)
+{
+    (void)x;
+    return (long)st_reader_outpage((volatile unsigned long *)g_mp, RD_N);
+}
+
 void _start(void)
 {
     volatile unsigned long *mp =
@@ -363,6 +425,7 @@ void _start(void)
     base_out = st_reader_outpage(mp, RD_N);
     base_in  = st_reader_inpage(mp, RD_N);
     g_base_out = base_out;
+    g_mp = (unsigned long)mp;
     out_str("base_out="); out_hex(base_out);
     out_str(" base_in="); out_hex(base_in);
     out_str("\n");
@@ -375,9 +438,13 @@ void _start(void)
          * 放在行首，保证任何 mode 下都能看到桩的状态。 */
         out_str("R r="); out_int(round);
         out_str(" mode="); out_int(mode);
-        out_str(" hooked="); out_int(st_hooked(round));
-        out_str(" hooked2="); out_int(st_hooked2(round));
-        out_str(" hooked3="); out_int(st_hooked3(round, 1000));
+        if (mode != 14) {
+            /* C14 例外：mmap FIXED 后受管页是 RW 匿名页，st_hooked 取指
+             * 必 SIGSEGV（首版实测进程 <1s 即死，prep 都来不及） */
+            out_str(" hooked="); out_int(st_hooked(round));
+            out_str(" hooked2="); out_int(st_hooked2(round));
+            out_str(" hooked3="); out_int(st_hooked3(round, 1000));
+        }
         out_str("\n");
 
         /* C1：读指令在页外，读受管页（对照，等价 shellwatch 的 sw_crc） */
@@ -530,6 +597,117 @@ void _start(void)
             out_str(" pfn1="); out_hex(pgmap_pfn((unsigned long)mp));
             out_str(" rd_eq_base=");
             out_int(st_reader_outpage(mp, RD_N) == base_out);
+            out_str("\n");
+        }
+
+        /* C10（mode=10 / 'a'）：只读页上的普通写必须 SIGSEGV（fork 子进程探针）。
+         * 旧 handler 会把受管页翻成 STEP RW 让写成功 —— 目标对自己的 r-x 代码页
+         * 写一个字节不崩，本身就是强检测向量，还会改坏原页。
+         * 新语义：SHADOW 下 WnR=1 非 cache op → 交原生；STEP 只读页写 → 交原生。
+         * 判据：wr_segv=1 且 crc_ok=1（写没落盘）且 hooked=777（桩还活着）。 */
+        if (mode == 10) {
+            out_str("C10 r="); out_int(round);
+            out_str(" hooked0="); out_int(st_hooked(round));
+            out_str(" rd="); out_int(st_reader_outpage(mp, RD_N) == base_out);
+            out_str(" wr_segv="); out_int(probe_segv(st_badwrite));
+            out_str(" crc_ok=");
+            out_int(st_reader_outpage(mp, RD_N) == base_out);
+            out_str(" hooked="); out_int(st_hooked(round));
+            out_str("\n");
+        }
+
+        /* C11（mode=11 / 'b'）：PROT_NONE 不被绕过、不活锁（fork 探针）。
+         * 旧 handler 会把 PROT_NONE 的数据 fault 翻 STEP（绕过），或把 STEP 下
+         * 的 fault 当 TLB 陈旧 flush+retry（PTE 仍是 PROT_NONE → 活锁）。
+         * 新语义：AP=0 的数据/取指 fault 一律交原生 SIGSEGV。
+         * 还原 RX 后 hooked 应当仍活；rd_eq_base 只记录 —— shadow PTE 被
+         * change_protection 重写过，读隐藏可能已破（mprotect 边界，非本格目标）。 */
+        if (mode == 11) {
+            int rc;
+            out_str("C11 r="); out_int(round);
+            rc = mprotect((void *)mp, 4096, SR_PROT_NONE);
+            out_str(" none_rc="); out_int(rc);
+            out_str(" rd_segv="); out_int(probe_segv(st_badread));
+            out_str(" ex_segv="); out_int(probe_segv(st_hooked));
+            rc = mprotect((void *)mp, 4096, SR_PROT_RX);
+            out_str(" rx_rc="); out_int(rc);
+            out_str(" hooked="); out_int(st_hooked(round));
+            out_str(" rd_eq_base=");
+            out_int(st_reader_outpage(mp, RD_N) == base_out);
+            out_str("\n");
+        }
+
+        /* C12（mode=12 / 'c'）：只读页上的 DC/IC 维护指令。
+         * handler 在 EL1 代做并 pc+=4 跳过：不翻 STEP、不 SIGSEGV、不活锁。
+         * 判据：cache_rc=4321（两条都走完）且 hooked=777 且 crc_ok=1。 */
+        if (mode == 12) {
+            long crc;
+            out_str("C12 r="); out_int(round);
+            out_str(" hooked0="); out_int(st_hooked(round));
+            out_str(" rd="); out_int(st_reader_outpage(mp, RD_N) == base_out);
+            crc = st_cacheop((void *)mp);
+            out_str(" cache_rc="); out_int(crc);
+            out_str(" hooked="); out_int(st_hooked(round));
+            out_str(" crc_ok=");
+            out_int(st_reader_outpage(mp, RD_N) == base_out);
+            out_str("\n");
+        }
+
+        /* C13（mode=13 / 'd'）：读类 GUP（/proc/self/mem pread）打受管页。
+         * 无 GUP 伴侣钩子时：SHADOW 的 PTE_SPECIAL 让 follow_page_pte 拿不到
+         * page → faultin_page 按 VMA 权限（r-x, UXN=0）重写 PTE → 桩静默死。
+         * 观测：pfn0/pfn1（pread 前后 PTE 指向：影子 PFN ≠ 原 PFN）、got（pread
+         * 返回字节数）、s/base（读到内容的校验和 vs 原页基线）、hooked。
+         * 判据（钩子工作时）：pfn0=影子 pfn1=影子、got=4096、s=base、hooked=777。 */
+        if (mode == 13) {
+            unsigned long buf[RD_N];
+            unsigned long s = 0;
+            long got;
+            int i, fd = open("/proc/self/mem", 0);
+
+            out_str("C13 r="); out_int(round);
+            out_str(" hooked0="); out_int(st_hooked(round));
+            out_str(" pfn0="); out_hex(pgmap_pfn((unsigned long)mp));
+            got = -1;
+            if (fd >= 0) {
+                got = pread(fd, buf, sizeof(buf), (long)(unsigned long)mp);
+                close(fd);
+            }
+            if (got == (long)sizeof(buf))
+                for (i = 0; i < RD_N; i++)
+                    s = s * 131 + buf[i];   /* 与 st_reader_outpage 同乘数 */
+            out_str(" got="); out_int(got);
+            out_str(" w10="); out_hex(buf[10]);   /* 0x50: 原页=b 桩=movz777 */
+            out_str(" s="); out_hex(s);
+            out_str(" base="); out_hex(base_out);
+            out_str(" pfn1="); out_hex(pgmap_pfn((unsigned long)mp));
+            out_str(" gup_ok=");
+            out_int(got == (long)sizeof(buf) && s == base_out);
+            out_str(" hooked="); out_int(st_hooked(round));
+            out_str("\n");
+        }
+
+        /* C14（mode=14 / 'e'）：munmap + mmap(MAP_FIXED) 感知正路径（0.6.3）。
+         * 安全约束（与 C7/C8 的关键差异）：mmap FIXED 会把受管页 PTE 换成
+         * 新匿名页，之后该地址的**任何**访问（连调 st_hooked 观测也不行）
+         * 都会把 KPM 的 fault 路径带进未知分支——所以本格全程不碰 mp
+         * 内容，只做两个 syscall + 打印返回值。
+         * 页表安全性：munmap 一页只清 PTE 不拆 PT（.text VMA 多页还在）→
+         * KPM 缓存的 pte_addr 槽位仍有效。
+         * 收尾流程固定：kill 目标 → unload（目标已死，restore 走
+         * target-gone 分支不碰页表）。
+         * 判据（mstat）：munmap_hits/mmap_hits 每轮各 +1，which=4/3，ret=0。 */
+        if (mode == 14) {
+            long rc;
+            long p;
+
+            out_str("C14 r="); out_int(round);
+            rc = munmap((void *)mp, 4096);
+            out_str(" | munmap rc="); out_int(rc);
+            p = mmap((void *)mp, 4096, 3 /* PROT_RW */,
+                     0x32 /* FIXED|PRIVATE|ANON */, -1, 0);
+            out_str(" mmap=");
+            out_hex((unsigned long)p);
             out_str("\n");
         }
 

@@ -10,7 +10,7 @@ Android arm64 无痕 hook 工具集。面向 frida 等公开工具特征明显�
 
 | 组件 | 类型 | 作用 | 关键约束 |
 |---|---|---|---|
-| **caoin-shadow** | 内核 KPM | shadow 页读写分离：改返回值 / 改参数（`argN=`，x0..x30）/ **透传执行原逻辑**（重定位桩），**不改代码字节**（过 CRC 自检）；影子页与 status 页**内核分配** → 目标 maps **零新增** | 目标对受管页做 `mprotect`/`madvise` → hook **静默失效**（页表被内核合法改写；实测自愈救不回） |
+| **caoin-shadow** | 内核 KPM | shadow 页读写分离：改返回值 / 改参数（`argN=`，x0..x30）/ **透传执行原逻辑**（重定位桩），**不改代码字节**（过 CRC 自检）；影子页与 status 页**内核分配** → 目标 maps **零新增** | 目标对受管页做 `mprotect`/`madvise` → hook **静默失效**（页表被内核合法改写；实测自愈救不回），但**可感知**：命中记录经 ctl0 `mstat` 查询（`mprot=0` 可关） |
 | **caoin-hw** | 内核 KPM | 硬件断点：参数观察、改寄存器（地址级，不碰 PTE/内存） | 仅 6 个断点槽；不能改执行流 |
 | **caoin** | CLI | 统一入口：`prep` / `shadow run|load|unload` / `hw` / `build` / `doctor` | 纯 shell，主机与设备通用 |
 | **caoin_prep** | CLI | KPM 流程自动化：远程符号解析（+ 可选准备影子页/status 页）→ 输出 KPM args | 只解析 dynsym（共享库导出符号）；`nommap` 模式全程不用 ptrace |
@@ -112,6 +112,36 @@ caoin shadow run <pid> <module|@> <symbol> --polymorph --stub
 重定位桩会重定位**被入口桩覆盖的 4 条序言指令**（跨页 B/BL、ADR/ADRP、CBZ/TBZ、LDR literal），
 之后函数体在原偏移继续执行 —— 所以能 hook **真实函数**（旧版不做重定位，只支持"寄存器运算型"）。
 
+`mprotect`/`madvise`/`munmap`/`mmap(MAP_FIXED)` 感知（0.6.1 引入、0.6.3 补全，
+默认开，`mprot=0` 关）：目标对受管页改权限/zap/换映射时 KPM 记录命中，随时查询
+（不救桩，只把"静默死"变"可查询"）。16 条环形命中历史（jiffies 时间戳）+
+kpmctl 自动 pretty print：
+
+```bash
+kpmctl su caoin-shadow "mstat"
+# mstat: mprot=26 madv=0 munmap=17 mmap=17 seq=60 now_jiffies=...
+#   #33 ts=... munmap addr=0x... len=0x1000 arg2=0x0 ret=0 view=2
+#   #34 ts=... mmap addr=0x... len=0x1000 arg2=0x32 ret=0x62... view=2
+#   ...（which: mprotect/madvise/munmap/mmap；arg2=prot/advice/flags；
+#        mmap 的 ret 是返回地址；view：0=orig 1=shadow 2=step）
+
+# 运行时改参（免 unload/reload）：白名单只放观察型（argN/capmax/verbose/mdeny/...），
+# 结构性参数（pid/tvaN/sva/...）load 时已固化，拒绝
+kpmctl su caoin-shadow "set verbose=0"
+kpmctl su caoin-shadow "get"     # 当前配置打印到 dmesg
+kpmctl su caoin-shadow "mclr"    # 清感知计数/环形（分段观察）
+```
+
+**`mdeny=1` 拦截模式（0.6.4，默认关）**——把"能过"做出来了（对校验型目标）：命中受管页的
+`mprotect`/`madvise` 直接吞掉（`skip_origin` + 返回 0 假装成功），PTE 不动、桩不死、
+CRC 照过。真机实测（selfread mode 7）：**78+ 轮 mprotect 后 `hooked` 保持 777**
+（无 mdeny 时第一轮就死）；madvise(DONTNEED) 同样被吞、桩活。局限（用它前必读）：
+
+- **自修改型目标会崩**：目标 mprotect(RWX) 是为了写代码 → 写 r-x 页 SIGSEGV——先 mstat
+  观察目标行为（改了不写=校验型可开；改了就写=别开）
+- **maps 权限不一致可检测**：目标 mprotect(RWX) 拿到成功但 `/proc/self/maps` 仍 `r-xp`
+- munmap / mmap(MAP_FIXED) **不拦**（返回值语义/行为异常面大，只感知）——见能力边界
+
 ### KPM 硬件断点（参数观察 / 改寄存器）
 
 ```bash
@@ -129,7 +159,7 @@ caoin hw unload
 
 | 约束 | 原因 | 影响 |
 |---|---|---|
-| **`mprotect`/`madvise` 改写受管页 PTE** | caoin 的状态（影子 PFN + execute-only 权限）只存在 PTE 里，而 `mprotect`/`madvise` 是**内核（EL1）**在改页表——PTE 的 AP/UXN 位只约束 EL0，对内核没有任何约束力。且 `mprotect` **保留 PFN、只重写权限位**（不是"把原页换回来"） | 实测（`selfread` mode 7）：`mprotect` 后影子页 PFN 不变，但后果取决于跷跷板当时停在哪一态——**SHADOW 态 → 影子页失去 execute-only、变成 EL0 可读 → 读隐藏破**（目标能读到桩字节，CRC 自检即可发现；实测 `rd_eq_base=0`）；**STEP 态 → 原页被改成可执行 → 桩静默失效且从此不再 fault**（实测桩立即变回原返回值并永久不再恢复）。`madvise(MADV_DONTNEED)` 则是 zap PTE、按 VMA 重建 → 回到原页、桩失效。同权限 `mprotect` 被内核早退、PTE 不动（实测确认）。自愈（重写影子 PTE）实测**救不回** |
+| **`mprotect`/`madvise` 改写受管页 PTE** | caoin 的状态（影子 PFN + execute-only 权限）只存在 PTE 里，而 `mprotect`/`madvise` 是**内核（EL1）**在改页表——PTE 的 AP/UXN 位只约束 EL0，对内核没有任何约束力。且 `mprotect` **保留 PFN、只重写权限位**（不是"把原页换回来"） | 实测（`selfread` mode 7）：`mprotect` 后影子页 PFN 不变，但后果取决于跷跷板当时停在哪一态——**SHADOW 态 → 影子页失去 execute-only、变成 EL0 可读 → 读隐藏破**（目标能读到桩字节，CRC 自检即可发现；实测 `rd_eq_base=0`）；**STEP 态 → 原页被改成可执行 → 桩静默失效且从此不再 fault**（实测桩立即变回原返回值并永久不再恢复）。`madvise(MADV_DONTNEED)` 则是 zap PTE、按 VMA 重建 → 回到原页、桩失效。同权限 `mprotect` 被内核早退、PTE 不动（实测确认）。自愈（重写影子 PTE）实测**救不回**。**缓解（0.6.1–0.6.3 感知）**：钩 `SyS_mprotect`/`SyS_madvise`/`SyS_munmap`/`SyS_mmap` 入口主动感知——不救桩（EL1 改页表无解），但把"静默死"变"可查询"：命中数/地址/长度/prot/advice/flags/返回值/命中时刻各 hook 视图 + 16 条环形历史（含 jiffies 时间戳），经 `kpmctl su caoin-shadow "mstat"` 直接人读；实测 mode 7 下桩第一轮被打死、mstat 全程有记录（hits=130、`hit_view=STEP`）；C14 实测 munmap/mmap(MAP_FIXED) 每轮各记 1 次。同权限 `mprotect` 在入口层与破坏性调用不可区分，也会计入 hits——破坏与否仍按本表判据区分。**反击（0.6.4 `mdeny=1`，默认关）**：受管页的 mprotect/madvise 直接拦截（`skip_origin` + ret=0），syscall 根本不执行——**对校验型目标（改权限不写页）是完整解：桩不死、CRC 照过**（实测 78+ 轮 mprotect `hooked` 保持 777）；对自修改型目标（mprotect RWX 后写代码）会把它弄崩，且 maps 权限不一致可被目标读出——开之前先用 mstat 观察目标行为 |
 | **KPM shadow 并发下 TLB 抖动** | 每次视图切换会在别的核留下陈旧翻译，纠正一次 = 一次全量 `tlbi vmalle1is`（本机 `vaae1is` 在 fault 上下文活锁、`alle1is` panic，只剩全量可用） | 修复前实测 4 线程下 98% 的 handler 进入都在纠正陈旧 TLB，且**一 engage 就活锁**；修复（桩装完补 flush + 取指 permission fault 也纠正）后同一压测（4 线程 / 4.19e9 次迭代）取指纠正降到 1727 次、`bad=0`。低频调用场景可忽略 |
 | **改关键函数返回值会崩** | 非 caoin 特有，frida 同样如此 | 改值要挑函数 / 用条件 hook |
 | **硬件断点仅 6 槽** | 硬件资源上限（本机 brps=6 wrps=4） | 只能同时观察少量点 |
@@ -140,6 +170,20 @@ caoin hw unload
 |---|---|---|---|
 | KPM shadow | ✓ 不破 | **零新增**（影子页内核分配；实测 maps 95→95 无 diff） | ✓ |
 | KPM 硬件断点 | ✓ 不破 | 无（不动内存） | ✗（仅改寄存器） |
+
+### 内核版本适配（5.10 已实测）
+
+除 4.9 外，5.10（MTK MT6895 / OnePlus Ace，39 位 VA + KASAN_HW_TAGS + CFI/PAC）也已跑通主链路，按内核代际自动切换：
+
+- **vaddr 换算**：vendor 的 `_PAGE_OFFSET(va) = -(1<<va)`（39 位下 `0xffffff8000000000`）、vmemmap 基址按式现算；启动时用已知内核 VA 自检（物理必须 <1TB），错了会打 `page_offset fixed=...`
+- **struct page 布局**：`_refcount` 5.10 在 0x34；加载时 `pgcheck` 只读自检（map/ref/memcg 形态），异常自动关记账
+- **`mm_off`**：用 `get_task_mm()` 返回值反查 task_struct（实测 0x518），不依赖编译期偏移
+- **页表读取**：优先内核 `follow_pte`（5.10 手工链读页表在 KASAN_HW_TAGS 内核上会失败）
+- **fork 防护**：5.10 `copy_process` 是 4 参（`kernel_clone_args`），已适配（实测 300 次 fork pause/resume）
+- **硬件断点（caoin-hw）**：5.10 实测执行断点 + 改寄存器（`add <pid> <tva> x0=0x64` → 返回值恒定 307）、`hit` 快照、4 线程压测 17M 迭代无异常；修了 5.10 特有的 MDSCR.SS 单步位泄漏（目标命中断点后被抢占 → 下一个任务收 SIGTRAP）
+- **感知/拦截**：`__arm64_sys_*` wrapper 入口，含 madvise；`mstat`/`mdeny` 在 5.10 实测通过
+- **5.10 上 RSS 计数保持关闭**：偏移已确认（0x2d8，与 statm resident 对得上），但按视图记账在并发脱同步时无法逐次配平（实测漂移 0.37%~9%），只保留 rmap/pin
+- **已知问题**：偶发 load 后目标不 fault（陈旧 TLB，`hooked` 保持原值）——**reload 一次即恢复**；目标存活时 unload 泄漏 4K（避免 stale-TLB UAF）
 
 ## 与 wxshadow 的关系
 

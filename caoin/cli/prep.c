@@ -108,13 +108,22 @@ static uintptr_t find_free_near(pid_t pid, uintptr_t center, size_t len)
     uintptr_t hi = center + (2UL << 30);
     uintptr_t cur = (lo + 0xFFF) & ~(uintptr_t)0xFFF;
     uintptr_t best = 0, best_d = ~(uintptr_t)0;
+    uintptr_t best_score = ~(uintptr_t)0;
     char line[512];
-    int ngap = 0;
+    int ngap = 0, prev_anon = 1;
 
+    /* 落位偏好：夹在匿名映射之间的空洞（混进游戏自己的 anon 页堆），
+     * 而不是紧贴 .so 的孤立空洞——后者是 maps 扫描的典型特征。 */
     while (fgets(line, sizeof(line), f)) {
         uintptr_t s, e;
+        int this_anon;
         if (sscanf(line, "%lx-%lx", &s, &e) != 2) continue;
-        if (e <= lo || s >= hi) continue;
+        this_anon = (strchr(line, '/') == NULL);   /* 无路径 = 匿名/[heap]/[stack] */
+        if (e <= lo || s >= hi) {
+            prev_anon = this_anon;
+            if (e > cur) cur = e;
+            continue;
+        }
         if (s > cur) {
             uintptr_t gap_end = s;
             if (gap_end - cur >= len) {
@@ -126,11 +135,18 @@ static uintptr_t find_free_near(pid_t pid, uintptr_t center, size_t len)
                         cand = near;
                 }
                 uintptr_t d = cand > center ? cand - center : center - cand;
+                uintptr_t score = d + ((prev_anon || this_anon)
+                                       ? 0 : (1UL << 28));
                 ngap++;
-                if (d < best_d) { best_d = d; best = cand; }
+                if (score < best_score) {
+                    best_score = score;
+                    best_d = d;
+                    best = cand;
+                }
             }
         }
         if (e > cur) cur = e;
+        prev_anon = this_anon;
     }
     if (hi > cur && hi - cur >= len) {
         uintptr_t cand = cur;
@@ -140,8 +156,13 @@ static uintptr_t find_free_near(pid_t pid, uintptr_t center, size_t len)
                 cand = near;
         }
         uintptr_t d = cand > center ? cand - center : center - cand;
+        uintptr_t score = d + (prev_anon ? 0 : (1UL << 28));
         ngap++;
-        if (d < best_d) { best_d = d; best = cand; }
+        if (score < best_score) {
+            best_score = score;
+            best_d = d;
+            best = cand;
+        }
     }
     fclose(f);
     if (best)
@@ -270,16 +291,73 @@ static uintptr_t call_remote(pid_t pid, uintptr_t func, const uintptr_t args[6])
 
 static void usage(void)
 {
-    fprintf(stderr, "usage: caoin_prep <pid> <module_pat|@> <symbol|tva=0x...> [nommap|hint=0x...]\n"
+    fprintf(stderr, "usage: caoin_prep <pid> <module_pat|@> <symbol|tva=0x...> [nommap|svaonly|inject|hint=0x...]\n"
+                    "       caoin_prep cleanup <pid> <hex-addr>...\n"
                     "  tva=<hex>: 跳过符号解析，直接用给定地址（适用于符号被抹除的目标，\n"
                     "             例如从 P/Invoke delegate 缓存读出的 luaL_loadbuffer 指针）\n"
                     "  nommap: 不远程 mmap 影子页/status 页（交给 KPM 内核分配），\n"
-                    "          目标 maps 零新增 VMA，且全程不用 ptrace\n");
+                    "          目标 maps 零新增 VMA，且全程不用 ptrace\n"
+                    "  svaonly: 只 mmap status 页（handler/trampoline 的家）\n"
+                    "  inject: svaonly + 注入缓冲页（injva），供 KPM 前置注入\n"
+                    "  cleanup: 远程 munmap prep 建的页（status/shadow/inject 页）。\n"
+                    "           KPM 卸载不会回收这些页，不清理会在目标 maps 留匿名 RW VMA\n");
     exit(1);
+}
+
+/* cleanup <pid> <hex-addr>...：远程 munmap prep 建的页。
+ * 必须在 KPM 卸载之后调用（status 页还在被 KPM 用时 munmap 会让它写失败）。
+ * 目标已退出时 munmap 无意义（页随 mm 释放），失败不致命。 */
+static int do_cleanup(int argc, char **argv)
+{
+    pid_t pid = (pid_t)atoi(argv[2]);
+    uintptr_t libc, f_munmap;
+    char p[64];
+    int i, st;
+
+    snprintf(p, sizeof(p), "/proc/%d/mem", pid);
+    g_memfd = open(p, O_RDWR);
+    if (g_memfd < 0) {
+        fprintf(stderr, "[prep] cleanup: open mem: %s\n", strerror(errno));
+        return 0;
+    }
+
+    libc = find_module(pid, "libc.so");
+    if (!libc) {
+        fprintf(stderr, "[prep] cleanup: target %d gone (libc.so not in maps)\n", (int)pid);
+        return 0;
+    }
+    f_munmap = remote_symbol(libc, "munmap");
+    if (!f_munmap)
+        DIE("cleanup: munmap not resolvable");
+
+    if (ptrace(PTRACE_ATTACH, pid, 0, 0) != 0) {
+        fprintf(stderr, "[prep] cleanup: attach failed: %s\n", strerror(errno));
+        return 0;
+    }
+    waitpid(pid, &st, 0);
+    get_regs(pid, &g_saved);
+
+    for (i = 3; i < argc; i++) {
+        uintptr_t a = (uintptr_t)strtoull(argv[i], NULL, 16) & ~0xFFFUL;
+        uintptr_t cargs[6] = { a, 4096, 0, 0, 0, 0 };
+        long long r;
+
+        if (!a)
+            continue;
+        r = (long long)(intptr_t)call_remote(pid, f_munmap, cargs);
+        fprintf(stderr, "[prep] cleanup: munmap(%llx, 4096) -> %lld\n",
+                (unsigned long long)a, r);
+    }
+
+    set_regs(pid, &g_saved);
+    ptrace(PTRACE_DETACH, pid, 0, 0);
+    return 0;
 }
 
 int main(int argc, char **argv)
 {
+    if (argc >= 4 && strcmp(argv[1], "cleanup") == 0)
+        return do_cleanup(argc, argv);
     if (argc != 4 && argc != 5) usage();
     pid_t pid = (pid_t)atoi(argv[1]);
     const char *module = argv[2];
@@ -343,8 +421,10 @@ int main(int argc, char **argv)
 
     /* svaonly：只准备 status 页（handler/trampoline 的家），不读目标页。
      * 用于"内核 shadow + 用户 status"配置；避免对正在执行的代码页做
-     * /proc/mem 预取（实测会把目标卡死）。 */
-    int svaonly = (argc > 4 && strcmp(argv[4], "svaonly") == 0);
+     * /proc/mem 预取（实测会把目标卡死）。
+     * inject：svaonly + 注入缓冲页（injva，KPM 把 snippet+原 buffer 拼这里）。 */
+    int inject = (argc > 4 && strcmp(argv[4], "inject") == 0);
+    int svaonly = (argc > 4 && strcmp(argv[4], "svaonly") == 0) || inject;
 
     /* 远程 mmap 影子页 + status 页（RW 匿名） */
     uintptr_t a_sh[6] = { 0, 4096, PROT_READ | PROT_WRITE,
@@ -379,14 +459,40 @@ int main(int argc, char **argv)
         wr_mem(sva, &z, 8);
     }
 
+    /* 注入缓冲页（inject 模式）：单页 RW，KPM 写入 [snippet][原 buffer]，
+     * 再把 x1/x2 指过来。必须 fault-in（KPM 走页表 walk 拿 PFN）。 */
+    uintptr_t injva = 0;
+    if (inject) {
+        uintptr_t iv_hint = find_free_near(pid, hint_addr ? hint_addr : tva, 4096);
+        uintptr_t a_iv[6] = { iv_hint, 4096, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS
+                                  | (iv_hint ? MAP_FIXED : 0),
+                              (uintptr_t)-1, 0 };
+        injva = call_remote(pid, f_mmap, a_iv);
+        if (injva == (uintptr_t)-1)
+            DIE("inject page mmap failed");
+        {
+            unsigned long z = 0;
+            wr_mem(injva, &z, 8);
+        }
+        LOG("inject page = %llx", (unsigned long long)injva);
+    }
+
     set_regs(pid, &g_saved);
     ptrace(PTRACE_DETACH, pid, 0, 0);
-    LOG("prepared: tva=%llx shva=%llx sva=%llx (detached)",
-        (unsigned long long)tva, (unsigned long long)shva, (unsigned long long)sva);
+    LOG("prepared: tva=%llx shva=%llx sva=%llx injva=%llx (detached)",
+        (unsigned long long)tva, (unsigned long long)shva,
+        (unsigned long long)sva, (unsigned long long)injva);
 
     /* 输出可直接喂给 caoin-shadow 的 args */
-    printf("pid=0x%x tva=0x%llx shva=0x%llx sva=0x%llx\n",
-           (unsigned)pid, (unsigned long long)tva,
-           (unsigned long long)shva, (unsigned long long)sva);
+    if (inject)
+        printf("pid=0x%x tva=0x%llx shva=0x%llx sva=0x%llx injva=0x%llx\n",
+               (unsigned)pid, (unsigned long long)tva,
+               (unsigned long long)shva, (unsigned long long)sva,
+               (unsigned long long)injva);
+    else
+        printf("pid=0x%x tva=0x%llx shva=0x%llx sva=0x%llx\n",
+               (unsigned)pid, (unsigned long long)tva,
+               (unsigned long long)shva, (unsigned long long)sva);
     return 0;
 }

@@ -399,6 +399,108 @@ v1 = 换页版（执行与读取同走 shadow 页）；v2 读写分离后，配�
 
 **当前剩余卡点**：独立页版已部署，实测 fault 链路已触发到主循环 CRC 读（flt#30 far=tva+0x110），但 [G]（哨兵 vfork 父恢复）未出现、515 输出未达——怀疑点：STEP 分支新加的 ec=24 重试对哨兵页二次 fault 的放行路径 / vfork 父子恢复时序。待下一轮定位。
 
+## mprotect/madvise 感知（2026-10-26，真机验证通过，0.6.1）
+
+**动机**：边界实测里"受管页被 mprotect 改写 → 桩静默死"的根因之一是感知盲区——自愈挂在 fault 路径，而 STEP 态被改成可执行后**不再 fault**，模块永远不知道发生了什么。被动等 fault 是死路，主动观察：`hook_wrap3` 挂 `SyS_mprotect`/`SyS_madvise` 入口（回退 `sys_*` 符号；madvise 用 `udata=(void*)1` 区分，同一对 before/after 复用）。只读记录不改参不拿锁（syscall 入口未持 mmap_sem）。madvise 只记 `DONTNEED(4)`/`FREE(8)` 防噪音。查询走 ctl0 `mstat`（15×u64 二进制出参，kpmctl 零改动）。
+
+**真机实测（equuleus，selfread mode 7/8/9）**：
+- C7：桩第一轮就被 RWX mprotect 打死（`hooked` 立即回原值，与边界实测一致），但 mstat 全程有记录：`mprot_hits=130`（每轮 RWX+RX 交替两次）、`addr/len/arg2/ret` 全对、**`hit_view=STEP`**（C7 的 rd0 先翻 STEP，mprotect 落在最危险的态上）——dmesg verbose 逐条 `mprotect hit ... arg2=7/5 view=2` 交替
+- C8：`madv_hits=10` 与跑动轮数吻合；C9：同权限调用照计入 hits（入口层与破坏性调用不可区分，属预期，破坏判据仍看边界表）
+- 回归：unload→reload 无 -4094；第二次会话感知照常；卸载统计行新增 `mprot=/madv=`
+
+**已知小瑕疵**：dmesg 命中打印限速计数与 mprotect/madvise 共用（前 8 次配额被先到的类型用完，后到的类型只剩 mstat 通道）；不影响计数与查询。
+
+**实验方法坑**：selfread 的 mode 由 `selfread.mode` 文件每轮重读、argv 无效。从 mode=6 **热切换**到 7 会活锁（4 个 C6 竞态线程与 C7 页外读写对跷跷板拉锯，State=R 持续）——C7 必须干净单独跑（先写 mode 文件再起新进程）。mode 文件与 sr.log 若被 root 跑过会留 root 属主，shell 写入 Permission denied，`su -c rm` 清掉即可。
+
+## mstat v2：环形命中历史 + kpmctl pretty print（2026-10-26，真机验证通过，0.6.2）
+
+**功能**：v1 只记"最近一次"命中，目标反复改权限时历史全丢。v2 加 16 条环形记录（ts=jiffies/which/addr/len/arg2/ret/view），mstat 出参带 `magic=0xCA0F6552` 版本校验，kpmctl 检测到 mstat 出参自动 pretty print（`kpmctl su caoin-shadow "mstat"` 一条命令人读输出）；dmesg 命中打印限速配额按 mprotect/madvise 拆分（v1 共用配额是实测发现的小瑕疵）。
+
+**真机实测**：C7 逐轮 ts 差 30 jiffies（300ms/轮，HZ=100，时间轴校验一致）；RWX(0x7)/RX(0x5) 交替、view=2（STEP）；C8 的 madvise 记录自身讲述完整语义——zap 前命中 view=2、zap 后 view=0（原生重建）。
+
+**大坑：KPM 里 struct 赋值 = 隐式 libc `memcpy` 调用 → 加载即 `-ENOENT`**。v2 首版 `st.rec[k] = g_mp_log[idx]`（56B struct 拷贝）被 GCC 生成显式 `memcpy` 调用，KP 的 KPM 重定位器（`symbol_lookup_name`）不提供 libc 符号 → `[-] KP E unknown symbol: memcpy` → kpatch 报 `load failed: -1 (errno=2)`。**错误码极具误导性**：errno=2 看起来像文件/路径问题，dmesg 里那行 "unknown symbol" 也不带模块名（按 caoin/kpm grep 会漏掉）。修复：struct 拷贝改逐字段赋值；此后每次改 KPM 代码，`readelf -sW xx.kpm | grep UND` 检查只剩 KP 已知符号（hook_wrap/hook_unwrap_remove/kf_*/kallsyms_lookup_name/printk）。旧代码 parse_args capfind 的 `memcpy` 能活是因为该路径 -O2 下内联成 ld/st 序列、没生成 UND 重定位——同样写法换个尺寸阈值就炸，不能侥幸。
+
+**实验流程注意**：每次会话结束把 `selfread.mode` 恢复/确认成下一轮要跑的值（本轮曾被自己上轮恢复的 6 坑：新起 selfread 期望 C7 实际跑 C6 多线程）；errno=17 是模块已载（先 unload），errno=2 除文件问题外优先查 dmesg "unknown symbol"。
+
+## 感知补全 + 运行时配置面（2026-10-26，真机验证通过，0.6.3）
+
+**功能**：①感知钩子组扩到四类——`SyS_munmap`（hook_wrap2）/ `SyS_mmap`（hook_wrap6，只记 MAP_FIXED=0x10，提示式 mmap 记录无意义），与 mprotect/madvise 共用 `mp_record`（公共相交判定 + 环形 + 限速按四类各 8 次）；`g_mp_seq` 改 `__atomic_add_fetch`（两核并发命中防丢记）。mstat v3（magic=0xCA0F6553）加 munmap/mmap_hits。②ctl0 运行时配置：`set <k>=<v>`（白名单只有观察型：argN/capmax/capmin/capoff/captext/injmin/verbose/quiet/mprot/rearm；结构性参数 load 时固化为页表状态，运行时改必乱，黑名单拒绝 rc=-1）、`get`（dmesg 打印）、`mclr`（清计数/环形/配额，分段观察用）。③selfread 加 C14（mode=14/'e'）。
+
+**真机实测**：C14 正路径 munmap/mmap 每轮各记 1（arg2=0x32=FIXED|PRIVATE|ANON，mmap 的 ret 是返回地址非 errno）；kill→unload 收尾无新 Bad page；`set verbose=0` 后 `get` 确认生效；`mclr` 后计数从 0 重新增长（钩子不受影响）；模块在载数分钟系统全程正常（四钩子覆盖全系统 mmap/munmap，负样本稳定性过）。
+
+**C14 的安全设计（重要，复用流程时别省）**：
+- **必须先 load 再切 C14**——locate 的 oracle 要求受管页 PTE valid+UXN=0，C14 的 munmap/mmap 循环让 PTE 在 none/RW 间摆动，起进程即 C14 会 locate fail（errno=1）
+- **C14 期间禁止一切受管页访问**：主循环 R 行的 `st_hooked` 观测在 mode=14 下必须跳过（首版漏了，mmap FIXED 后取指 RW 页 → 原生 SIGSEGV，进程存活 <1s，prep 都来不及）
+- **收尾顺序 kill → unload**（目标死后 restore 走 target-gone 分支不碰页表）；munmap 单页不拆 PT（.text 多页 VMA 还在）→ KPM 缓存 pte_addr 槽位仍有效，这是 C14 安全的前提
+
+**本轮三个低级坑（自省）**：①块注释里写 `stub*/kalloc` ——`*/` 把注释提前闭合，后面中文变代码，编译错误定位在 3684 行但病灶在注释（写参数列表时严禁 `*/` 序列）。②`selfread.mode` 文件状态第三次咬人：argv 无效、mode 全由文件驱动，**每次起 selfread 前必须先写 mode 文件**（这次留 'e' 没改，`selfread 7` 实际跑 C14 → locate fail，排查绕了一圈）。③adb push 覆盖已有二进制会丢执行位，push 后必 `chmod 755`。
+
+## mdeny：拦截模式（2026-10-26，真机验证通过，0.6.4）
+
+**动机**：感知只回答"目标干了什么"，没回答"能不能扛"。拦截路线：命中受管页的 mprotect/madvise 在 before 里 `skip_origin=1 + ret=0`——syscall 根本不执行，目标拿到伪造的成功。对**校验型目标**（mprotect 改了又改回、不写页）这是完整解：PTE 不动 → 桩不死、读隐藏保持、CRC 读原页照过；且没有"主动恢复"路线的拉锯（根本不让改）。
+
+**真机实测（selfread mode 7/8，mdeny=1）**：78+ 轮 mprotect 后 `hooked` 保持 **777**（0.6.3 无 mdeny 时第一轮就死）；`rwx rc=0` 伪造成功、`rd_eq_base=1`；view 在 2/1 正常交替（跷跷板不受影响——mprotect 没碰 PTE，读/取指翻转照常）；madvise(DONTNEED) 同样被吞、桩活；`mprot=276 madv=14 denied=290`（全拦），环形记录带 DENIED 标记、ret=0 为伪造值。
+
+**设计决策：munmap/mmap FIXED 不拦**（即使 mdeny=1）：munmap 吞掉后目标"访问已 unmap 地址"却进我们的 fault 翻转、行为异常本身是检测向量；mmap FIXED 返回值语义是地址，伪造后目标写新映射必 SIGSEGV。只拦返回 0 语义完整的两类。
+
+**已知边界（用前必读，README 同步）**：①自修改型目标（mprotect RWX 为了写代码）被我们弄崩（写 r-x 页 SIGSEGV）——**先 mstat 观察目标 mprotect 模式再决定开**；②目标读 /proc/self/maps 能发现"mprotect 成功但权限没变"（堵它要伪造 seq_file 输出，战线过大不做）。
+
+**工程细节**：mrec 加 denied 字段（mstat v4，magic=0xCA0F6554）；mdeny 进 set 白名单（运行时开关）；denied 记录的 ret 是伪造的 0 而非真实 syscall 返回。构建坑：WSL/Windows 时钟差导致 make 报 Clock skew——cp 后若怀疑没重编，`touch -d '1 hour ago'` 源文件再 make，并 `strings xx.kpm | grep 版本号` 确认。
+
+## 5.10 内核适配（2026-11-03，MTK MT6895 真机）
+
+**设备**：OnePlus Ace（PGKM10），MT6895，`5.10.168-android12-9-o-gfe2d8ffc60e6`，39 位 VA、KASAN_HW_TAGS、CFI/PAC；KernelPatch 走 boot 补丁（kptools + kpimg）。
+
+### 7 处根因（全部有真机日志/现场）
+
+1. **PAGE_OFFSET 是 vendor 变体**：`_PAGE_OFFSET(va) = -(1UL << va)`（不是标准 `<< (va-1)`），39 位下 = `0xffffff8000000000`；TCR 推算的 `0xffffffc0...` 是错的。修：`caoin_fix_page_offset(known_va)` 用已知线性映射内核 VA（task/kstatus）验证候选（物理必须 < 1TB）。
+   **坑**：探测最初只在 kstatus 分支——传了用户 `sva=` 就不分配 kstatus → 探测被跳过 → `caoin_va` 用错误基址，桩写入 `0xffffffc2...` 未映射区 → oops（现场：`str w3,[x0,x1]`，x0=0xffffffc2fdc7f000）。探测必须前移到 `find_task_by_vpid` 之后。
+2. **vmemmap 基址是 4.9 常量**：5.10 要算 `-(VMEMMAP_SIZE + 2M)`，`VMEMMAP_SIZE = ((1<<(VA_BITS-1))>>6)` → 39 位下 `0xfffffffeffe00000`。修前 `page_remove_rmap` 访问未映射 vmemmap → panic。
+3. **struct page.\_refcount**：4.9 在 0x1c，5.10 在 **0x34**（`_mapcount` 0x30、memcg 0x38）。加 pgcheck 只读自检：实测 `map=0 ref=2 memcg=合法内核指针`。
+4. **`mm_off` 被 follow_pte 路径置 0**：`caoin_is_target_proc()`/`__switch_to` 靠 `task+mm_off` 读 mm，目标 fault 全被判成"非目标"放行给原生路径（原生不刷 TLB → 要么自己活锁、要么把 PTE 修回原页）。修：用 `get_task_mm()` 返回的 mm 反查 task_struct，实测 **0x518**。
+5. **KPTI 扫描把 `mmv+off` 当 mm 传给 follow_pte**：那是候选 pgd 指针不是 mm → 第一次扫到就 oops。改回手工 `caoin_walk_pgd(caoin_va(upgd), ...)`。
+6. **`orig_pte` 被自己的 UXN 污染**：STEP→SHADOW 时把 STEP 的 UXN=1 抄进 `orig_pte`；卸载恢复出的 PTE 带 UXN → EL0 不可取指 → 目标下次调用死循环。修：acct 只同步 AP；`caoin_off_pte` 遇到 `cur == origview_pte_val` 不采纳。
+7. **卸载用错 before/after 对**：感知钩子用 wrapper 安装却用旧三参对摘除 → 残留项指向已释放模块，下次 mprotect/mmap/munmap 跳飞（现场：reload 时 init SIGSEGV → do_exit BUG → panic）。修：per-hook `*_wrap` 标志，按实际安装对摘。
+
+### 并发（mode 6，4 线程）
+
+- **UXN 误判**：SHADOW 视图收到取指 permission fault 时检查 `cur & PTE_UXN` 以尊重 mprotect——并发下 `cur` 可能是我们自己刚写的 STEP 视图，被误判成 mprotect → 放行原生 → 不刷 TLB → 死循环。修：`cur == origview_pte_val` 时不算 mprotect。
+- **反向脱同步无自愈**：`view=STEP` 但 PTE 仍是影子页时只 flush 不重写 PTE（AP=0x80 永远拒绝 EL0 数据访问）→ 死循环。修：SHADOW/STEP 分支各加一条精准重写（仅当 PTE 的 PFN 确认是自家影子页/原页）。
+- **实测**：120s 压测 **165M 迭代、`bad=0`、`hooked=777`、`state=S`**，卸载后目标继续跑；`entries=132M overlap=123M desync_a=30.8M desync_b=23.8M rearm_cnt=6.7M`。
+- 顺带排除：`mmap_lock` 偏移 0x70 经源码字段+配置核对在这台也是对的（debug 锁全关、无 compat mmap bases）。
+
+### fork 防护（5.10 4 参）
+
+`copy_process(pid, trace, node, struct kernel_clone_args *)`，clone_flags 在 `kernel_clone_args->flags`（偏移 0）。新增 `before/after_copy_process4` + `hook_wrap4`，按内核代际选 8 参/4 参；卸载按同一对摘链。实测 mode 4（fork 压力）300 次 pause/resume，子进程 `status=0`、`hooked=777`。
+
+### 用户态 shva 影子页 / mdeny / 感知（5.10 实测）
+
+- **shva 路径**：`kshadow=0`、桩写进 shva（`stub installed shva=... off=40 val=777`）、status 页走用户 sva（`wstat va=... slot=...`），`hooked=777`。
+  注意：prep 的 shva/sva 页长期不用会被回收（PTE 不 present）→ load 时 `wstat walk fail`，重跑 prep 即可。
+- **mdeny=1**：mprotect `rc=0` 但 PFN 不变、`hooked=777`；madvise(DONTNEED) `rc=0`、PFN 不变、`hooked=777`；`mstat` `mprot=64 madv=14 denied=78`，DENIED 标记/视图快照正确。
+
+### RSS 记账（结论：5.10 上保持关闭）
+
+- 这台 5.10 的 `mm->rss_stat` 仍是旧的 `struct mm_rss_stat`（4×atomic_long），位置 **0x2d8**（`saved_auxv[46]` 之后；4.9 是 0x2b0）。
+  **实测校验**：加载时 `file=747 anon=462 swap=0 shmem=112`，总和 1321 == `/proc/pid/statm` resident。
+- **但按视图记账在并发脱同步下无法逐次配平**：压测 `acct1 - acct0` 偏差 0.37%（47k/78M entries）；随后尝试"修复路径补记账"反而放大到 9%（修复路径在卡住态反复触发）。偏差直接体现为原页 `_mapcount`/`_refcount` 漂移（`pgcheck map=0xb8b5 ref=0xa52`）。
+- **决定**：5.10 上 RSS 计数保持关闭（`if (!g_kver5)`），rmap/pin 保留；`rss=` 仍可覆盖。pgcheck 增加 map/ref 上限 0x1000 兜底（污染页直接 `acct off`）。统计口径失真可接受，写坏 mm_struct/page 不行。
+
+### 硬件断点（caoin-hw）5.10 实测
+
+- 构建：`caoin_hw.c` 单独编 KPM（新增 `kpms/caoin-hw` Makefile）。注意两件事：①源码里唯一一处 `memcpy` 要换字节循环（KPM 重定位器无 libc 符号）；②GCC -O2 会把拷贝循环又优化回 `memcpy`，必须加 `-fno-builtin -fno-tree-loop-distribute-patterns`。
+- 加载：`task_struct.mm` 偏移探针自动得到 **0x518**；三个入口全部找到——`breakpoint_handler`(r2) / `single_step_handler`(r2) / `watchpoint_handler`(r2)，与 5.10 的 `do_debug_exception → inf->fn(addr, esr, regs)` 一致；`brps=6 wrps=4`。
+- **执行断点 + 改寄存器**：`add <pid> <tva> x0=0x64` → 目标 `st_hooked(round)` 的返回值从 `3n+7` 变成恒定 **307**（=3×0x64+7），`hit` 能取到寄存器快照；4 线程 mode 6 压测 17M 迭代 `bad=0`，目标/init 存活。
+- **5.10 特有坑（已修）**：目标命中断点后、单步异常前被抢占时，原实现会在 `__switch_to` 里 pop 掉出向任务的单步记录，但 **MDSCR_EL1.SS 是 per-CPU 且内核不随任务切换** → 下一个任务（实测是 init）收到 SIGTRAP → `do_exit` BUG → panic。修：切换时不再丢记录；按"incoming 任务是否有挂起单步"置/清 MDSCR.SS；mm 销毁时清掉对应记录（防任务指针复用）。
+- 卸载：`disarm` + unload 后目标恢复原行为（`hooked=3n+7`），无残留。
+- **未测**：watchpoint（`addw`）路径已挂钩但本次没有合适的数据地址做功能验证（现有测试程序的写地址不稳定）。
+
+### 已知问题（未解决）
+
+- **间歇性 engage 失败**：偶发 load 后目标完全不 fault（`entries=0`、`hooked` 保持 `3n+7`），即目标各核 TLB 仍持有原页翻译；`vmalle1is` + `__switch_to` 本核 flush 都执行了。**reload 一次即恢复**（复现 2 次）。未定位，怀疑跨 cluster 的 TLBI 可见性/广播域，后续可用 `vaae1is`/IPI 方案对比。
+- **目标存活时 unload 泄漏 4K**：不释放内核分配的 shadow/status 页，换掉 stale-TLB UAF。
+- 卸载汇总会同时打 `target alive -> leaked` 与 `PTE state not OFF -> leaked`（后者是 `safe` 被 alive 置 0 后的副产物，日志语义待整理）。
+
 ## 注意
 
 - **本目录在博客仓库内，暂不推送**。开源前必须明确决策——源码公开 = 字节模式进特征库，核心优势归零

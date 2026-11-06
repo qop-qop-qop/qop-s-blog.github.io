@@ -34,6 +34,7 @@
 #include <ktypes.h>
 #include <linux/string.h>
 #include <hook.h>
+#include <linux/sched.h>
 
 /* ---- PTE 位定义（arm64，自包含） ---- */
 #define PTE_VALID      (1UL << 0)
@@ -167,6 +168,55 @@ struct caoin_hook {
 static struct caoin_hook hooks[CAOIN_MAX_HOOKS];
 static int hooks_n;
 static volatile int g_fork_pause;   /* >0 = fork 快照期间，fault 不翻 PTE */
+static u64 g_fork_view[CAOIN_MAX_HOOKS];   /* 首 fork 保存的视图（pause 期间无人写） */
+/* ---- per-CPU 懒安装（__switch_to）----
+ * 跨核可见性修复（2026-10-25 真机实证）：engage 在 insmod 核翻 PTE 并
+ * tlbi vmalle1is 广播，游戏执行核仍沿用旧翻译——perflua 同址记录 65 次
+ * 真实调用而 sent=0；而内核原生 COW 的 flush_tlb_page 之后 78/78 命中。
+ * 对策：把"本核可见"挂到调度器——每核第一次切进目标 mm 的线程时，做一次
+ * 本地 tlbi + ic iallu，此后该核取指/走表必然看到影子页里的桩。
+ * 只用本核操作，不 on_each_cpu（IPI 路线在 KP 下死锁，真机实证）。
+ * 键用 TPIDR_EL1（arm64 per-CPU 基址，每核唯一），免内核符号。 */
+static void *g_switch_to;        /* __switch_to（4.9: (prev, next)） */
+static u64 g_cpu_key[32];        /* 已维护的核（TPIDR_EL1 基址） */
+static int g_cpu_key_n;
+static volatile u64 g_cpu_armed_cnt;
+/* ---- 前置注入（injmode）----
+ * 哨兵 fault 时把 [snippet][原 buffer] 写到目标 mm 的 injva 页（prep 提供），
+ * 再把 x1/x2 改成新 buffer/长度，原函数照常编译执行。
+ * snippet 由 injhex（hex 编码的 Lua 源码）提供；injmin 是长度门限——
+ * 注入脚本自己触发的嵌套 load（标记串）小于门限，不会二次注入（防递归）。
+ * 约束：单页，inj_len + 原长度 <= injmax（默认 0x1000）。 */
+static u64 cfg_injva;             /* 注入缓冲页（目标 mm，prep mmap） */
+static u64 cfg_inj_max = 0x2000;  /* 缓冲页大小（2 页） */
+static u64 cfg_inj_min = 0x100;   /* 只注入长度 >= 该值的 buffer */
+static unsigned char inj_buf[4096];
+static int inj_len;
+static u64 inj_cnt;
+/* ---- kalloc 模式（无 ptrace）----
+ * status/注入页不靠 prep 远程 mmap，而是在目标**自己的 fault 上下文**用
+ * vm_mmap 建页——此时 current 就是目标线程，current->mm 正确；装桩也在
+ * 目标核上做（ic iallu 本核生效）。prep 只读 maps/mem 解析 tva，零 ptrace。 */
+static u64 g_kalloc;
+static volatile int g_pending_kalloc;
+static int g_kalloc_tries;       /* 近槽搜索重试次数 */
+static unsigned long (*kfn_vm_mmap)(void *, unsigned long, unsigned long,
+                                    unsigned long, unsigned long,
+                                    unsigned long);
+static int (*kfn_do_munmap)(void *, unsigned long, unsigned long);
+static void (*kfn_down_write)(void *);
+static void (*kfn_up_write)(void *);
+static unsigned long (*kfn_get_unmapped_area)(void *, unsigned long,
+                                              unsigned long, unsigned long,
+                                              unsigned long);
+static void *(*kfn_find_vma)(void *, unsigned long);
+/* injfind：按 buffer 内容子串匹配才注入（读前 256 字节找）。
+ * 只改目标 chunk，缩小内容哈希/loader 重试面。真机实测：本游戏
+ * luaL_loadbuffer 的 chunkname(x3) 是空的，按名字匹配不可用。 */
+static unsigned char inj_find[64];
+static int inj_find_len;
+static unsigned char inj_name[64];   /* 保留：x3 非空的目标可用 */
+static int inj_name_len;
 
 /* ---- kallsyms 解析的内核函数 ---- */
 static long (*kfn_probe_read)(void *, const void *, unsigned long);
@@ -175,6 +225,11 @@ static long (*kfn_copy_to_user)(void *, const void *, unsigned long);
 static void *(*kfn_find_task_by_vpid)(int);
 static s64 *kvar_memstart_addr;
 static unsigned long page_offset_base;
+/* ARM64 5.10: struct page._refcount 在 0x34（4.9 是 0x1c）。由 linux_banner
+ * 的大版本号判定；VMEMMAP_START 也随代际换成新公式（见 caoin_pfn_to_page）。 */
+static int g_kver5;
+static int g_page_ref_off = 0x1c;
+static unsigned int g_va_bits = 39;
 
 /* ---- 页记账（修复 Bad page state / Bad rss-counter）----
  * shadow PTE 指向内核分配的页，内核不知道这个映射。zap（exit_mmap/
@@ -195,7 +250,9 @@ static void (*kfn_page_remove_rmap)(void *, int);
 static void (*kfn_page_add_file_rmap)(void *, int);
 static void (*kfn___put_page)(void *);
 static unsigned long g_rss_off = 0x2b0;   /* mm->rss_stat.count[0] */
+static int g_rss_set;                     /* rss= 显式给了值 */
 static u64 g_acct_on = 1;                 /* acct=0 关闭（排障用） */
+static u64 g_acct_n0, g_acct_n1;          /* 记账次数诊断：进入/离开影子 */
 
 /* ---- mmap_sem 同步 ----
  * 我们的 do_page_fault 钩子挂在函数入口，内核是在函数内部才
@@ -226,7 +283,58 @@ static u64 g_verbose;   /* verbose=1 开流程日志；默认静音（无痕优�
 static u64 g_quiet;     /* quiet=1 连错误日志也不打（生产无痕用） */
 static u64 g_polymorph; /* polymorph=1 随机化入口桩寄存器/stub 值/status magic */
 static u64 g_stub_seed; /* polymorph 的派生种子（init 时由 tva/pid/task 生成） */
+static u64 g_tlb_page;  /* tlbpage=1/2 逐页 TLBI 实验（默认 0=全量 vmalle1is） */
 static void *g_copy_process;   /* fork 防护 hook 目标（装不上为 NULL） */
+static int g_copy4;            /* copy_process 用的是 5.10 的 4 参 hook */
+static void *g_follow_pte;     /* GUP 伴侣 hook 目标（装不上为 NULL） */
+static volatile u64 g_gup_cnt; /* 读类 GUP 命中受管页、翻 STEP 的次数 */
+/* ---- mprotect/madvise 感知（观察型）----
+ * 边界实测：受管页被 mprotect/madvise 改写 PTE → hook 静默失效；STEP 态
+ * 被改成可执行后不再 fault，挂在 fault 路径上的自愈永远没机会跑。
+ * 对策：主动观察——挂 syscall 入口（SyS_mprotect/SyS_madvise），命中受管页
+ * 范围就计数+记录，用户态 ctl0 "mstat" 查询。只读不改参数、不 skip_origin；
+ * 入口处尚未持 mmap_sem，这里也不拿任何锁（竞态最多漏记一次）。 */
+static void *g_mprot;          /* SyS_mprotect 钩子目标（装不上为 NULL） */
+static void *g_madv;           /* SyS_madvise 钩子目标（装不上为 NULL） */
+static void *g_munmap;         /* SyS_munmap 钩子目标（装不上为 NULL） */
+static void *g_mmap;           /* SyS_mmap 钩子目标（装不上为 NULL） */
+/* 安装时用的是 wrapper 对（wrap_before/wrap_after）还是旧三参对——卸载必须
+ * 用同一个 before/after 指针摘链，否则残留项指向已释放模块（UAF）。 */
+static int g_mprot_wrap, g_madv_wrap, g_munmap_wrap, g_mmap_wrap;
+static u64 cfg_mprot = 1;      /* mprot=0 关闭感知（默认开：纯观察零干扰） */
+static u64 cfg_mdeny;          /* mdeny=1 拦截受管页的 mprotect/madvise
+                                * （skip_origin + ret=0 假装成功；默认关——
+                                * 自修改型目标（mprotect RWX 后写代码）会被
+                                * 我们弄崩：写 r-x 页 SIGSEGV。先 mstat 观察
+                                * 目标行为再决定开不开） */
+static volatile u64 g_mprot_hits, g_madv_hits;  /* 命中受管页范围次数 */
+static volatile u64 g_munmap_hits, g_mmap_hits;
+static volatile u64 g_mdeny_hits;               /* 实际拦截次数 */
+static u64 g_mp_which;         /* 最近命中：1=mprotect 2=madvise 3=mmap_fixed 4=munmap */
+static u64 g_mp_addr, g_mp_len, g_mp_arg2;      /* arg2=prot/advice/flags */
+static u64 g_mp_ret;           /* 最近命中的 syscall 返回值（after 记） */
+static u64 g_mp_view[CAOIN_MAX_HOOKS];          /* 命中时刻各 hook 视图快照 */
+/* 命中历史环形缓冲（mstat v2）：last 只有一条，目标反复改权限时历史全丢，
+ * 对"目标何时做完整性校验"的分析是硬伤。16 条 × (ts,which,addr,len,arg2,ret,view,denied)。
+ * ts 用 jiffies（kallsyms 解析不到则恒 0）；ret 在 after 里回填 slot（存
+ * local.data[1]），并发窗口内可能错位到相邻记录（观察型，可接受）。
+ * seq 用原子递增（两核并发命中时防丢记/错位）。 */
+#define CAOIN_MPLOG 16
+#define CAOIN_MP_MAGIC 0xCA0F6554ULL   /* mstat 出参版本校验，kpmctl 侧镜像 */
+struct caoin_mrec {
+    u64 ts, which, addr, len, arg2, ret, view, denied;
+};
+static struct caoin_mrec g_mp_log[CAOIN_MPLOG];
+static u64 g_mp_seq;           /* 累计命中序号（环形 idx = (seq-1) % 16） */
+static volatile unsigned long *kvar_jiffies;    /* kallsyms "jiffies"，可缺 */
+static int g_walk_dbg;
+static void *kfn_follow_pte;    /* follow_pte：内核自己的页表 walk（5.10+KASAN_HW_TAGS 下手工 walk 读页表会失败） */
+static void *kfn_spin_unlock;
+static void *kfn_get_task_mm;   /* get_task_mm：内核函数拿真实 mm（正确偏移，免 mm_off 推导） */
+static void *kfn_mmput;
+static void *kfn_virt_to_phys;  /* __virt_to_phys：现场反推真实 PAGE_OFFSET */         /* mmput：释放 get_task_mm 的引用（unload 时） */   /* _raw_spin_unlock：follow_pte 成功后释放 pte 页锁 */   /* locate 诊断限速 */
+static u64 g_mp_logn[4];       /* dmesg 命中打印限速：四类各自 8 次 */
+static unsigned long g_vma_mm_off = 0x40; /* vma->vm_mm 偏移（4.9，vmm= 覆盖） */
 static u64 g_stub_onload;      /* stub=1：加载即装桩（跳过 INJ_REQ 握手，
                                 * 供 caoin_prep 自动化流程——目标不发请求） */
 /* recstub 的"改参数"规格：argN=<val>（N=0..7）时 handler 先把 xN 改成该值再跑
@@ -261,6 +369,35 @@ static int caoin_emit_movx(u32 *dst, int rd, u64 v)
 #define CK_LOG(...) do { if (g_verbose) pr_info(__VA_ARGS__); } while (0)
 
 /* ---- 地址换算 ---- */
+/* PAGE_OFFSET 探测：vendor 5.10 把 _PAGE_OFFSET(va) 改成 -(1<<va)，39 位下
+ * 是 0xffffff8000000000，不是标准 arm64/TCR 推算的 0xffffffc0...。用任意
+ * 已知线性映射内核 VA（task 指针 / kstatus）验证：其物理必须 < 1TB。
+ * 必须在所有 caoin_va/caoin_pa 使用之前调用，且不能只在 kstatus 分支里——
+ * 用户态 sva 路径不分配 kstatus（真机实测：跳过探测 → stub 写到
+ * 0xffffffc2... 未映射区 → oops）。 */
+static void caoin_fix_page_offset(unsigned long known_va)
+{
+    unsigned long mst, cands[2];
+    int ci;
+
+    if (!known_va || !kvar_memstart_addr)
+        return;
+    mst = (unsigned long)*kvar_memstart_addr;
+    cands[0] = page_offset_base;            /* TCR 推算 */
+    cands[1] = 0xffffff8000000000UL;        /* 39 位 VA 空间起点 */
+    for (ci = 0; ci < 2; ci++) {
+        unsigned long pa = known_va - cands[ci] + mst;
+
+        if (pa < (0x1UL << 40)) {           /* 物理 < 1TB：合理 */
+            if (page_offset_base != cands[ci]) {
+                page_offset_base = cands[ci];
+                CK_ERR("caoin-kpm: page_offset fixed=%lx\n", page_offset_base);
+            }
+            break;
+        }
+    }
+}
+
 static unsigned long caoin_va(unsigned long pa)
 {
     return (unsigned long)((pa - (u64)*kvar_memstart_addr) + page_offset_base);
@@ -351,9 +488,26 @@ static int caoin_walk_pgd(unsigned long pgd_virt, unsigned long va,
     return 1;
 }
 
-/* 按 hook 的 mm_run_pgd 走任意 VA（存在证明/参数校验用） */
+/* 按 mm_run 走任意 VA（follow_pte：5.10+ 手工链读页表会失败） */
 static int caoin_walk_pgd_via_mm(unsigned long va, unsigned long *pte_a_out)
 {
+    if (kfn_follow_pte && kfn_spin_unlock && mm_run) {
+        void *ptepp = 0, *ptlp = 0;
+
+        if (((int (*)(void *, unsigned long, void **, void **))kfn_follow_pte)
+                ((void *)mm_run, va, &ptepp, &ptlp) == 0) {
+            if (!ptepp) {
+                if (ptlp)
+                    ((void (*)(void *))kfn_spin_unlock)(ptlp);
+                return 0;
+            }
+            ((void (*)(void *))kfn_spin_unlock)(ptlp);
+            if (pte_a_out)
+                *pte_a_out = (unsigned long)ptepp;
+            return 1;
+        }
+        return 0;
+    }
     return caoin_walk_pgd(mm_run_pgd, va, pte_a_out);
 }
 
@@ -374,6 +528,40 @@ static int caoin_cur_pte(struct caoin_hook *h, u64 *out)
  * 再经内核线性地址读。不能直接 probe_kernel_read(user_va)：PAN 下 EL1
  * 访问用户 VA 会失败（capture 实测 p=... l=0x10000 直接 READFAIL）。
  * 大页支持是必须的：il2cpp/Lua 堆常用 THP，2MB block 在 L2 的 bit1=0。 */
+static int hexval(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* 写目标 mm 的用户页（按页 walk + 内核线性别名写；注入 buffer 用）。
+ * 注意：两个 cacheable 映射同 PA，缓存天然一致，无需 dc 维护（数据读）。 */
+static int caoin_write_user(unsigned long va, const void *src, unsigned long n)
+{
+    const unsigned char *s = (const unsigned char *)src;
+
+    while (n) {
+        unsigned long pte_a = 0, pte_v = 0, kva, off = va & 0xFFFUL, chunk;
+
+        if (!caoin_walk_pgd_via_mm(va, &pte_a))
+            return -1;
+        if (kfn_probe_read(&pte_v, (void *)pte_a, 8)
+            || !(pte_v & CAOIN_PFN_MASK))
+            return -1;
+        kva = caoin_va(pte_v & CAOIN_PFN_MASK);
+        chunk = 0x1000 - off;
+        if (chunk > n)
+            chunk = n;
+        memcpy((void *)(kva + off), s, chunk);
+        s += chunk;
+        va += chunk;
+        n -= chunk;
+    }
+    return 0;
+}
+
 static int caoin_read_user(void *dst, unsigned long va, unsigned long n)
 {
     unsigned char *d = (unsigned char *)dst;
@@ -427,16 +615,22 @@ static int caoin_read_user(void *dst, unsigned long va, unsigned long n)
 static unsigned long caoin_shadow_kva(struct caoin_hook *h)
 {
     unsigned long pte_a = 0, pte_v = 0;
+    unsigned long kva = 0;
+    int lk;
 
     if (!h)
         return 0;
     if (h->kshadow)
         return h->kshadow;
+    /* 用户态 shva 的 walk 也可能与 munmap 拆页表竞争，拿读锁。 */
+    lk = caoin_mm_lock();
     if (caoin_walk_pgd_via_mm(h->shva, &pte_a)
         && !kfn_probe_read(&pte_v, (void *)pte_a, 8)
         && (pte_v & CAOIN_PFN_MASK))
-        return caoin_va(pte_v & CAOIN_PFN_MASK);
-    return 0;
+        kva = caoin_va(pte_v & CAOIN_PFN_MASK);
+    if (lk)
+        caoin_mm_unlock();
+    return kva;
 }
 
 static void status_mark(u64 v);
@@ -582,7 +776,14 @@ static void *caoin_pfn_to_page(u64 pfn)
 {
     unsigned long pa = (unsigned long)(pfn << 12);
     unsigned long ms = (unsigned long)(s64)*kvar_memstart_addr;
-    return (void *)(CAOIN_VMEMMAP_BASE + ((pa - ms) >> 6));
+    unsigned long base = CAOIN_VMEMMAP_BASE;
+
+    /* 5.10 arm64: VMEMMAP_START = -(VMEMMAP_SIZE + 2M)，
+     * VMEMMAP_SIZE = ((1 << (VA_BITS-1)) >> 6)。39 位下是 0xfffffffeffe00000。
+     * 4.9 沿用实测常量（0xffffffbf00000000）。 */
+    if (g_kver5 && g_va_bits >= 32 && g_va_bits < 48)
+        base = 0UL - (((1UL << (g_va_bits - 1)) >> 6) + 0x200000UL);
+    return (void *)(base + ((pa - ms) >> 6));
 }
 
 static void caoin_acct_orig(struct caoin_hook *h, int add)
@@ -615,12 +816,13 @@ static void caoin_acct_orig(struct caoin_hook *h, int add)
                 h->origview_pte_val = (cur & ~PTE_UXN) | PTE_UXN;
                 h->shadow_pte_val = (cur & ~(CAOIN_PFN_MASK | PTE_AP_MASK | PTE_UXN))
                                    | (sh_pfn << 12) | 0x80UL | CAOIN_PTE_SPECIAL;
-            } else if ((cur & (PTE_AP_MASK | PTE_UXN))
-                       != (h->orig_pte & (PTE_AP_MASK | PTE_UXN))) {
-                /* 同一页但 mprotect 改了权限：更新缓存的 AP/UXN，
-                 * 否则 STEP 的 RO/RW 判断会用旧权限。 */
-                h->orig_pte = (h->orig_pte & ~(PTE_AP_MASK | PTE_UXN))
-                            | (cur & (PTE_AP_MASK | PTE_UXN));
+            } else if ((cur & PTE_AP_MASK) != (h->orig_pte & PTE_AP_MASK)) {
+                /* 同一页但 mprotect 改了权限：更新缓存的 AP。
+                 * 只同步 AP——此处的 cur 是 STEP 视图（UXN=1 是我们自己加的，
+                 * 不是 VMA 的权限）；连 UXN 一起抄会把 orig_pte 污染成
+                 * EL0 不可取指，卸载恢复后目标取指死循环（5.10 真机实测）。 */
+                h->orig_pte = (h->orig_pte & ~PTE_AP_MASK)
+                            | (cur & PTE_AP_MASK);
                 h->origview_pte_val = (h->orig_pte & ~PTE_UXN) | PTE_UXN;
             }
         }
@@ -631,22 +833,30 @@ static void caoin_acct_orig(struct caoin_hook *h, int add)
         /* 回到原页：先还 pin，再把 rmap/RSS 加回来 */
         if (h->pinned) {
             if (kfn___put_page
-                && __atomic_sub_fetch((int *)((char *)pg + 0x1c), 1,
+                && __atomic_sub_fetch((int *)((char *)pg + g_page_ref_off), 1,
                                       __ATOMIC_RELEASE) == 0)
                 kfn___put_page(pg);
             h->pinned = 0;
         }
         if (kfn_page_add_file_rmap)
             kfn_page_add_file_rmap(pg, 0);
-        __atomic_add_fetch((long *)(mm_run + g_rss_off), 1, __ATOMIC_RELAXED);
+        /* RSS 计数在 5.10 上保持关闭：偏移已确认（0x2d8，file+anon+swap+
+         * shmem == statm resident），但按视图记账在并发脱同步时无法保证
+         * 逐次配平（实测 resident 每秒涨上千页）。统计口径失真可接受，
+         * 写坏 mm_struct 不行。需要实验时用 rss= 覆盖并自行承担。 */
+        if (!g_kver5)
+            __atomic_add_fetch((long *)(mm_run + g_rss_off), 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_acct_n1, 1, __ATOMIC_RELAXED);
     } else {
         /* 进入 SHADOW：原页不再被这个 VMA 映射 → 摘 rmap/RSS，
          * 并 get_page 钉住它（否则页缓存会回收原页，缓存的 orig_pte 悬空）。 */
         if (kfn_page_remove_rmap)
             kfn_page_remove_rmap(pg, 0);
-        __atomic_add_fetch((int *)((char *)pg + 0x1c), 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch((int *)((char *)pg + g_page_ref_off), 1, __ATOMIC_RELAXED);
         h->pinned = 1;
-        __atomic_sub_fetch((long *)(mm_run + g_rss_off), 1, __ATOMIC_RELAXED);
+        if (!g_kver5)
+            __atomic_sub_fetch((long *)(mm_run + g_rss_off), 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_acct_n0, 1, __ATOMIC_RELAXED);
     }
 }
 
@@ -659,7 +869,7 @@ static void caoin_unpin_orig(struct caoin_hook *h)
         return;
     pg = caoin_pfn_to_page(h->orig_pfn);
     if (kfn___put_page
-        && __atomic_sub_fetch((int *)((char *)pg + 0x1c), 1,
+        && __atomic_sub_fetch((int *)((char *)pg + g_page_ref_off), 1,
                               __ATOMIC_RELEASE) == 0)
         kfn___put_page(pg);
     h->pinned = 0;
@@ -736,6 +946,26 @@ static u64 caoin_step_pte(struct caoin_hook *h, u64 cur)
     return h->origview_pte_val;
 }
 
+/* OFF 视图：恢复原页，但 AP/UXN 跟随 VMA 当前状态（mprotect 可能改过）。
+ * 否则 fork-pause 的快照会带过宽权限——实测 C11：PROT_NONE 页的快照变成
+ * 可读（rd_segv=0）。cur 的三分支与 caoin_step_pte 相同。 */
+static u64 caoin_off_pte(struct caoin_hook *h, u64 cur)
+{
+    if ((cur & CAOIN_PFN_MASK) == (h->orig_pte & CAOIN_PFN_MASK)) {
+        /* 同 PFN 有两种来源：内核/mprotect 写的原生 PTE（整体采纳），
+         * 或**我们自己**写的 STEP 视图（origview，UXN 是我们加的）。
+         * 后者绝不能采纳——否则卸载恢复的 PTE 带 UXN，目标取指死循环
+         * （5.10 真机实测：unload 后卡死在下次调用）。 */
+        if (cur != h->origview_pte_val)
+            h->orig_pte = cur;   /* 原页现值整体生效（含内核改过的任意位） */
+    } else if ((cur & CAOIN_PFN_MASK) == (h->shadow_pte_val & CAOIN_PFN_MASK)
+               && ((cur & PTE_AP_MASK) != 0x80UL || (cur & PTE_UXN) != 0)) {
+        h->orig_pte = (h->orig_pte & ~(PTE_AP_MASK | PTE_UXN))
+                    | (cur & (PTE_AP_MASK | PTE_UXN));
+    }
+    return h->orig_pte;
+}
+
 /* ---- mm->pgd 侧 flip（按 hook）---- */
 static void caoin_flip_hook(int hi, u64 view)
 {
@@ -777,6 +1007,16 @@ static void caoin_flip_hook(int hi, u64 view)
                 h->origview2_val = v2;
             }
         }
+        if (view == VIEW_OFF) {
+            v1 = caoin_off_pte(h, cur);
+            if (h->pte_addr2)
+                v2 = (h->orig_pte2 & ~(PTE_AP_MASK | PTE_UXN))
+                   | (v1 & (PTE_AP_MASK | PTE_UXN));
+        }
+        /* rmap/RSS 记账在 caoin_set_view 里按软件视图做——不在这里做。
+         * 教训（5.10 实测）：按 PTE 转换记账时 acct_orig 内部会二次读 PTE，
+         * 并发下这次读可能看到别的线程刚写的影子 PTE → 提前 return →
+         * 漏记一半，page->_mapcount 被写成 85 万（pgcheck 报警）。 */
         h->pte_addr = pte_a;
         caoin_set_pte((u64 *)pte_a, v1);
     }
@@ -809,6 +1049,7 @@ int caoin_fault_check(unsigned long addr, struct pt_regs_49 *regs,
 static void caoin_tlb_flush(unsigned long va);
 static void before_page_fault(hook_fargs3_t *args, void *udata);
 static int caoin_is_target_proc(void);
+static void caoin_kalloc_pages(void);
 
 /* ---- do_page_fault hook 主体 ---- */
 static void before_page_fault(hook_fargs3_t *args, void *udata)
@@ -856,12 +1097,32 @@ static void before_page_fault(hook_fargs3_t *args, void *udata)
                     l = cfg_capmax;
                 if (l < cfg_cap_min)
                     l = 0;             /* 太小：多半是 "ForEndOfFrame" 这类字符串 */
+                {
+                    /* 诊断：前 8 次哨兵命中打印 p/l/读结果（限速） */
+                    static u64 capdbg_n;
+                    if (capdbg_n < 8) {
+                        unsigned char t8[8];
+                        int rr = p ? caoin_read_user(t8, p, 8) : -1;
+                        CK_ERR("caoin-kpm: capdbg p=%lx l=%llx rd=%d "
+                               "b0=%02x%02x%02x%02x\n",
+                               (unsigned long)p, (unsigned long long)l, rr,
+                               rr ? 0 : t8[0], rr ? 0 : t8[1],
+                               rr ? 0 : t8[2], rr ? 0 : t8[3]);
+                        capdbg_n++;
+                    }
+                }
                 if (p && l && cfg_cap_text) {
                     unsigned char tmp[16];
                     unsigned long m = l < 16 ? l : 16;
                     unsigned long k;
                     int ok = 1;
                     if (caoin_read_user(tmp, p, m)) {
+                        static u64 crf_n;
+                        if (crf_n < 4) {
+                            crf_n++;
+                            CK_ERR("caoin-kpm: captext read fail p=%lx l=%llx\n",
+                                   (unsigned long)p, (unsigned long long)l);
+                        }
                         l = 0;
                     } else {
                         for (k = 0; k < m; k++) {
@@ -911,6 +1172,69 @@ static void before_page_fault(hook_fargs3_t *args, void *udata)
                     }
                 }
             }
+            /* 前置注入：把 snippet 拼到原 buffer 前面，改 x1/x2 指向 injva。
+             * 长度门限 injmin 防递归（注入脚本自己触发的嵌套 load 更短）。 */
+            if (cfg_injva && inj_len) {
+                u64 ip = regs->regs[cfg_cap_ptr >= 0 ? cfg_cap_ptr : 1];
+                u64 il = regs->regs[cfg_cap_len >= 0 ? cfg_cap_len : 2]
+                         & 0xFFFFFFFFULL;
+                int nmatch = 1;
+
+                if (inj_name_len) {
+                    /* 按 chunk 名（x3）子串匹配：只注入目标 chunk */
+                    char nm[64];
+                    u64 np = regs->regs[3];
+                    unsigned long k;
+
+                    nmatch = 0;
+                    if (np && !caoin_read_user(nm, np, sizeof(nm))) {
+                        nm[sizeof(nm) - 1] = 0;
+                        for (k = 0; nm[k] && k + (unsigned long)inj_name_len
+                                        < sizeof(nm); k++)
+                            if (!memcmp(nm + k, inj_name,
+                                        (unsigned long)inj_name_len)) {
+                                nmatch = 1;
+                                break;
+                            }
+                    }
+                }
+                if (nmatch && inj_find_len && ip) {
+                    /* 内容子串匹配：读 buffer 前 256 字节查找 */
+                    char fb[256];
+                    unsigned long fl = il < sizeof(fb) ? (unsigned long)il
+                                                       : sizeof(fb);
+                    unsigned long k;
+
+                    nmatch = 0;
+                    if (!caoin_read_user(fb, ip, fl)) {
+                        for (k = 0;
+                             k + (unsigned long)inj_find_len <= fl; k++)
+                            if (!memcmp(fb + k, inj_find,
+                                        (unsigned long)inj_find_len)) {
+                                nmatch = 1;
+                                break;
+                            }
+                    }
+                }
+                if (nmatch && ip && il >= cfg_inj_min
+                    && (unsigned long)(inj_len + (int)il) <= cfg_inj_max
+                    && (unsigned long)(inj_len + (int)il) <= 0x2000UL) {
+                    static unsigned char inj_stage[0x2000];   /* 与注入页一致（8KB），防溢出 */
+                    memcpy(inj_stage, inj_buf, (unsigned long)inj_len);
+                    if (!caoin_read_user(inj_stage + inj_len, ip, il)
+                        && !caoin_write_user(cfg_injva, inj_stage,
+                                             (unsigned long)inj_len + il)) {
+                        regs->regs[1] = cfg_injva;
+                        regs->regs[2] = (u64)(inj_len + (int)il);
+                        inj_cnt++;
+                        if (inj_cnt <= 4)
+                            CK_ERR("caoin-kpm: inject l=%llx -> %lx n=%llu\n",
+                                   (unsigned long long)il,
+                                   (unsigned long)cfg_injva,
+                                   (unsigned long long)inj_cnt);
+                    }
+                }
+            }
             regs->pc += 4;      /* 跳过哨兵读指令 */
             args->skip_origin = 1;
             args->ret = 0;
@@ -922,6 +1246,10 @@ static void before_page_fault(hook_fargs3_t *args, void *udata)
 
     if (!vbar_on || !regs)
         return;
+
+    /* kalloc：首次目标 fault 时在目标 mm 建 status/注入页并装桩 */
+    if (g_pending_kalloc && caoin_is_target_proc())
+        caoin_kalloc_pages();
 
     /* 注入请求探测——必须在跷跷板状态机之前（目标自身 fault 全被 handled
      * 短路，放后面永远不在目标上下文执行）。命中只置标记不劫持：劫持挪到
@@ -959,8 +1287,9 @@ static void before_page_fault(hook_fargs3_t *args, void *udata)
             if ((wv & CAOIN_PFN_MASK) == (h->shadow_pte_val & CAOIN_PFN_MASK))
                 continue;                 /* 仍是影子页，未漂移 ✓ */
 
-            /* 视图说 SHADOW 但 PTE 不是影子页 → 被外部改写 → 重 arm */
-            caoin_set_pte((u64 *)wa, h->shadow_pte_val);
+            /* 视图说 SHADOW 但 PTE 不是影子页 → 被外部改写 → 重 arm。
+             * 走 flip_hook：记账按 PTE 转换走（裸写会漏记 rmap/RSS）。 */
+            caoin_flip_hook(i, VIEW_SHADOW);
             caoin_tlb_flush(0);
             g_rearm_cnt++;
             CK_ERR("caoin-kpm: re-arm hook%d pte %lx -> %lx (view=SHADOW)\n",
@@ -1273,6 +1602,23 @@ int caoin_fault_check(unsigned long addr, struct pt_regs_49 *regs,
             g_mf_nottarget++;
             return 0;   /* 他进程同 VA：放行（勿吞勿翻，防活锁与视图污染） */
         }
+        /* 一次性诊断（前 8 条目标 fault）：确认当前视图/PTE 是否真的被改写。
+         * view=1 且 cur 仍是影子 PTE = 翻转没写进去；cur 已是 origview =
+         * PTE 写了但 CPU 仍按旧翻译 fault（TLB/BBM 问题）。 */
+        {
+            static u64 fd_n;
+            if (g_verbose && fd_n < 8) {
+                u64 _cur = 0;
+                int _have = caoin_cur_pte(h, &_cur);
+
+                fd_n++;
+                CK_ERR("caoin-kpm: fd#%llu view=%d have=%d cur=%llx "
+                       "orig=%llx step=%llx shadow=%llx esr=%x pc=%lx far=%lx\n",
+                       fd_n, (int)h->cur_view, _have, _cur,
+                       h->orig_pte, h->origview_pte_val,
+                       h->shadow_pte_val, esr, pc, addr);
+            }
+        }
 
         /* fork 快照期间不翻 PTE。等 pause 完成（有界）再放行原生，
          * 避免原生路径看到 SHADOW 的 permission fault。 */
@@ -1380,10 +1726,31 @@ int caoin_fault_check(unsigned long addr, struct pt_regs_49 *regs,
                  * 真的无效，flush 救不了，仍然放行。 */
                 if (ec == 0x20 && (esr & 0x3C) == 0x0C) {
                     u64 cur = 0;
-                    if (caoin_cur_pte(h, &cur) && (cur & PTE_UXN)) {
+                    if (caoin_cur_pte(h, &cur) && (cur & PTE_UXN)
+                        && cur != h->origview_pte_val) {
                         /* mprotect 去掉了执行权限（PROT_NONE/RO）：
-                         * 交给原生 SIGSEGV，不能当 TLB 陈旧重试。 */
+                         * 交给原生 SIGSEGV，不能当 TLB 陈旧重试。
+                         * 例外：cur == origview 是**我们自己**的 STEP 视图
+                         * （并发线程刚翻过去的），UXN 不是 mprotect 加的。
+                         * 此时放行给原生路径不会 flush TLB → 死循环
+                         * （5.10 mode=6 实测：stime 暴涨、目标卡死）。 */
                         ret = 0;
+                        goto mh_out;
+                    }
+                    /* 反向脱同步：view 说 SHADOW 但 PTE 是 STEP（别的线程
+                     * 刚翻过去）→ 只 flush 修不了（PTE 本身带 UXN），
+                     * 直接按 view 重写影子页再重试。 */
+                    if (caoin_cur_pte(h, &cur)
+                        && (cur & CAOIN_PFN_MASK)
+                           != (h->shadow_pte_val & CAOIN_PFN_MASK)) {
+                        /* 只重写 PTE，不在这里补记账：修复路径在"卡住态"
+                         * 会反复触发，逐次补记会放大不平衡（实测
+                         * acct1-acct0 从 0.37% 涨到 9%）。 */
+                        caoin_flip_hook(i, VIEW_SHADOW);
+                        caoin_tlb_flush(h->tva);
+                        g_rearm_cnt++;
+                        if (hit_out) *hit_out = i;
+                        ret = 1;
                         goto mh_out;
                     }
                     g_desync_a++;
@@ -1461,13 +1828,29 @@ int caoin_fault_check(unsigned long addr, struct pt_regs_49 *regs,
                     ret = 0;   /* PROT_NONE：native SIGSEGV */
                     goto mh_out;
                 }
-                if (wn && caoin_emulate_cacheop(h, regs)) {
+                /* RW 页（AP=01）上 cache op 不会 fault，WnR=1 的数据 fault
+                 * 只可能是 TLB 陈旧或普通写，不用花一次指令读去解码。 */
+                if (wn && ap != 0x40UL && caoin_emulate_cacheop(h, regs)) {
                     if (hit_out) *hit_out = i;
                     ret = 1;   /* cache 维护已代做，跳过指令 */
                     goto mh_out;
                 }
                 if (have && wn && ap == 0xC0UL) {
                     ret = 0;   /* 只读页写：native SIGSEGV */
+                    goto mh_out;
+                }
+                /* 反向脱同步：view 说 STEP 但 PTE 还是影子页（并发线程刚
+                 * 翻过去）。AP=0x80 的页对 EL0 数据访问永远 permission
+                 * fault，只 flush 不会让 PTE 变成可读 → 死循环（5.10
+                 * mode=6 实测：跑到 ~1.8e7 次迭代后卡死）。按 view 重写
+                 * STEP 再重试。PTE 已确认是自家影子页，页表结构稳定。 */
+                if (have && (cur & CAOIN_PFN_MASK)
+                            == (h->shadow_pte_val & CAOIN_PFN_MASK)) {
+                    caoin_flip_hook(i, VIEW_STEP);
+                    caoin_tlb_flush(h->tva);
+                    g_rearm_cnt++;
+                    if (hit_out) *hit_out = i;
+                    ret = 1;
                     goto mh_out;
                 }
                 g_desync_b++;   /* 可读页的数据 fault：脱同步/TLB 陈旧 */
@@ -1507,11 +1890,23 @@ mh_out:
 
 static void caoin_tlb_flush(unsigned long va)
 {
-    /* 实测：vaae1is 在此上下文无效（活锁）；alle1is 清全局项会毁掉
-     * KP trampoline 映射（undefined instruction panic）。改用 vmalle1is
-     * （清当前 VMID 全 ASID 的非全局项，内核 local_flush_tlb_all 同款） */
-    (void)va;
+    /* 默认全量 vmalle1is：实测 vaae1is 曾在此上下文活锁（根因未定位）；
+     * alle1is 清全局项会毁掉 KP trampoline 映射（panic）。
+     * tlbpage=1/2 是逐页实验开关（默认 0=全量）：1 = TLBI VAAE1IS
+     * （按 VA、全 ASID），2 = TLBI VAE1IS（按 VA、当前 ASID）。
+     * 两者都只清非全局项，开销从"整机/全 ASID"降到"一页"。活锁就关掉。 */
     asm volatile("dsb ish" ::: "memory");
+    if (g_tlb_page && va) {
+        u64 r = (u64)va >> 12;    /* XAE1IS: Xt[43:0] = VA[55:12] */
+
+        if (g_tlb_page == 2)
+            asm volatile("tlbi vae1is, %0" :: "r"(r) : "memory");
+        else
+            asm volatile("tlbi vaae1is, %0" :: "r"(r) : "memory");
+        asm volatile("dsb ish" ::: "memory");
+        asm volatile("isb" ::: "memory");
+        return;
+    }
     asm volatile("tlbi vmalle1is" ::: "memory");
     asm volatile("dsb ish" ::: "memory");
     asm volatile("isb" ::: "memory");
@@ -1519,40 +1914,184 @@ static void caoin_tlb_flush(unsigned long va)
 
 /* ---- 探测引擎（v1/v2b 验证版复用） ---- */
 
+/* KPM 用内核 follow_pte 拿 PTE（5.10 + KASAN_HW_TAGS：手工 walk 读页表
+ * 会失败；follow_pte 走内核自己的页表访问路径）。
+ * 成功后 ptepp 有效、持有 pte 页锁，读值后必须 _raw_spin_unlock。 */
+static int caoin_follow_pte_get(unsigned long mm_c, unsigned long va,
+                                unsigned long *pte_v_out,
+                                unsigned long *pte_a_out)
+{
+    void *ptepp = 0, *ptlp = 0;
+    int r;
+
+    if (!kfn_follow_pte || !kfn_spin_unlock)
+        return 0;
+    r = ((int (*)(void *, unsigned long, void **, void **))kfn_follow_pte)
+        ((void *)mm_c, va, &ptepp, &ptlp);
+    if (r)
+        return 0;
+    if (!ptepp) {
+        if (ptlp)
+            ((void (*)(void *))kfn_spin_unlock)(ptlp);
+        return 0;
+    }
+    *pte_v_out = *(volatile unsigned long *)ptepp;
+    ((void (*)(void *))kfn_spin_unlock)(ptlp);
+    if (pte_a_out)
+        *pte_a_out = (unsigned long)ptepp;
+    return 1;
+}
+
 static int caoin_probe_walk(unsigned long mm_cand, unsigned long pgd_off_cand,
                             unsigned long va, unsigned long expect_phys,
                             unsigned long *pte_a_out)
 {
     unsigned long pgd_p, e0, e2, pte_v, pte_a;
     const unsigned long m = CAOIN_PFN_MASK;
+    int d = 0;
 
-    if (kfn_probe_read(&pgd_p, (void *)(mm_cand + pgd_off_cand), 8))
+    /* 5.10+：内核 follow_pte（手工 walk 读页表在 KASAN_HW_TAGS 内核上会
+     * 返回错误内容/失败）。成功后 ptepp 有效、需 _raw_spin_unlock。 */
+    if (kfn_follow_pte && kfn_spin_unlock) {
+        void *ptepp = 0, *ptlp = 0;
+
+        if (((int (*)(void *, unsigned long, void **, void **))kfn_follow_pte)
+                ((void *)mm_cand, va, &ptepp, &ptlp) != 0)
+            return 0;
+        if (!ptepp) {
+            if (ptlp)
+                ((void (*)(void *))kfn_spin_unlock)(ptlp);
+            return 0;
+        }
+        pte_v = *(volatile unsigned long *)ptepp;
+        ((void (*)(void *))kfn_spin_unlock)(ptlp);
+        if (!(pte_v & 2))
+            return 0;
+        if (expect_phys && (pte_v & m) != expect_phys)
+            return 0;
+        if (pte_a_out)
+            *pte_a_out = (unsigned long)ptepp;
+        return 1;
+    }
+
+    if (g_walk_dbg < 3) {
+        d = 1;
+        g_walk_dbg++;
+    }
+    if (kfn_probe_read(&pgd_p, (void *)(mm_cand + pgd_off_cand), 8)) {
+        if (d) CK_ERR("walk: read pgd fail mm=%lx off=%lx\n", mm_cand, pgd_off_cand);
         return 0;
+    }
+    if (d) CK_ERR("walk: mm=%lx off=%lx pgd=%lx\n", mm_cand, pgd_off_cand, pgd_p);
     /* user_pgd（KPTI）由 vmalloc 分配，位于 vmalloc 区（< PAGE_OFFSET），
      * 不能用 page_offset_base 过滤——用内核高段下限 */
-    if (pgd_p < 0xffffff8000000000UL || (pgd_p & 0xFFF))
+    if (pgd_p < 0xffffff8000000000UL || (pgd_p & 0xFFF)) {
+        if (d) CK_ERR("walk: pgd rejected\n");
         return 0;
-    if (kfn_probe_read(&e0, (void *)(pgd_p + ((va >> 30) & 0x1FF) * 8), 8))
+    }
+    if (kfn_probe_read(&e0, (void *)(pgd_p + ((va >> 30) & 0x1FF) * 8), 8)) {
+        if (d) CK_ERR("walk: read e0 fail\n");
         return 0;
-    if (!(e0 & m))
+    }
+    if (d) CK_ERR("walk: e0=%lx (idx %lx)\n", e0, (va >> 30) & 0x1FF);
+    if (!(e0 & m)) {
+        if (d) CK_ERR("walk: e0 no phys\n");
         return 0;
-    if (!(e0 & 2))          /* 1GB block：本 walk 只处理 4K PTE */
+    }
+    if (!(e0 & 2)) {        /* 1GB block：本 walk 只处理 4K PTE */
+        if (d) CK_ERR("walk: e0 not table\n");
         return 0;
-    if (kfn_probe_read(&e2, (void *)caoin_va((e0 & m) + ((va >> 21) & 0x1FF) * 8), 8))
+    }
+    if (kfn_probe_read(&e2, (void *)caoin_va((e0 & m) + ((va >> 21) & 0x1FF) * 8), 8)) {
+        if (d) CK_ERR("walk: read e2 fail va2=%lx\n", caoin_va((e0 & m) + ((va >> 21) & 0x1FF) * 8));
         return 0;
-    if (!(e2 & m))
+    }
+    if (d) CK_ERR("walk: e2=%lx\n", e2);
+    if (!(e2 & m)) {
+        if (d) CK_ERR("walk: e2 no phys\n");
         return 0;
-    if (!(e2 & 2))          /* 2MB block：同上 */
+    }
+    if (!(e2 & 2)) {        /* 2MB block：同上 */
+        if (d) CK_ERR("walk: e2 not table\n");
         return 0;
+    }
     pte_a = caoin_va((e2 & m) + ((va >> 12) & 0x1FF) * 8);
-    if (kfn_probe_read(&pte_v, (void *)pte_a, 8))
+    if (kfn_probe_read(&pte_v, (void *)pte_a, 8)) {
+        if (d) CK_ERR("walk: read pte fail a=%lx\n", pte_a);
         return 0;
-    if (!(pte_v & 2))       /* level-3 必须是 page descriptor */
+    }
+    if (d) CK_ERR("walk: pte=%lx\n", pte_v);
+    if (!(pte_v & 2)) {     /* level-3 必须是 page descriptor */
+        if (d) CK_ERR("walk: pte not page\n");
         return 0;
+    }
     if (expect_phys && (pte_v & m) != expect_phys)
         return 0;
     if (pte_a_out)
         *pte_a_out = pte_a;
+    return 1;
+}
+
+/* 精确 pgd_off 推导：init_mm.pgd == &swapper_pg_dir（静态初始化保证）。
+ * 该内核的 init_task 是内核线程（mm=NULL, active_mm=&init_mm），但 init_task
+ * 内存里搜不到 init_mm 值（布局差异），故不用 active_mm 推 mm_off；
+ * 改为：init_mm 精确推 pgd_off → 再用目标 task 单层扫 mm_off（walk 验证）。 */
+static int caoin_locate_pgd_off(unsigned long *pgd_off_out)
+{
+    unsigned long init_mm, swapper, x, p;
+
+    init_mm = (unsigned long)kallsyms_lookup_name("init_mm");
+    swapper = (unsigned long)kallsyms_lookup_name("swapper_pg_dir");
+    if (!init_mm || !swapper)
+        return 0;
+    for (x = 0; x < 0x800; x += 8) {
+        if (kfn_probe_read(&p, (void *)(init_mm + x), 8))
+            continue;
+        if (p == swapper) {
+            CK_ERR("locate: pgd_off=%lx (init_mm=%lx swapper=%lx)\n",
+                   x, init_mm, swapper);
+            *pgd_off_out = x;
+            return 1;
+        }
+    }
+    CK_ERR("locate: pgd_off not found (init_mm=%lx swapper=%lx)\n",
+           init_mm, swapper);
+    return 0;
+}
+
+/* active_mm 推 mm_off：init_task.mm == NULL、active_mm == &init_mm，且
+ * task_struct 里 mm 与 active_mm 相邻（mm 在前）→ active_mm 偏移 - 8 即
+ * mm 偏移。该偏移对同布局的所有任务成立。 */
+static int caoin_locate_mm_off(unsigned long *mm_off_out)
+{
+    unsigned long init_task, init_mm, x, p, mm_off = 0;
+
+    init_task = (unsigned long)kallsyms_lookup_name("init_task");
+    init_mm = (unsigned long)kallsyms_lookup_name("init_mm");
+    if (!init_task || !init_mm)
+        return 0;
+    CK_ERR("locate: mm_off search init_task=%lx init_mm=%lx\n", init_task, init_mm);
+    {
+        u64 q = 0;
+
+        if (!kfn_probe_read(&q, (void *)(init_task + 0xe40), 8))
+            CK_ERR("locate: it+e40=%lx\n", q);
+        if (!kfn_probe_read(&q, (void *)(init_task + 0xe48), 8))
+            CK_ERR("locate: it+e48=%lx\n", q);
+    }
+    for (x = 16; x < 0x4000; x += 8) {
+        if (kfn_probe_read(&p, (void *)(init_task + x), 8))
+            continue;
+        if (p == init_mm) {
+            mm_off = x - 8;
+            break;
+        }
+    }
+    CK_ERR("locate: mm_off search result=%lx\n", mm_off);
+    if (!mm_off)
+        return 0;
+    CK_ERR("locate: init active_mm at %lx -> mm_off=%lx\n", mm_off + 8, mm_off);
+    *mm_off_out = mm_off;
     return 1;
 }
 
@@ -1562,21 +2101,205 @@ static int caoin_locate(unsigned long task, unsigned long va, unsigned long expe
                         unsigned long *mm_out, unsigned long *pte_a_out)
 {
     unsigned long mm_c, pgd_p, moff, poff;
-    for (moff = 0; moff < 0x1800; moff += 8) {
+    unsigned long fixed_pgd_off = 0;
+    int mm_cands = 0, pgd_cands = 0, walks = 0, oracle_fails = 0;
+
+    /* 5.10+：get_task_mm 拿真实 mm（内核函数用正确偏移，免 mm_off 推导），
+     * follow_pte 拿 PTE（手工 walk 读页表会失败）。 */
+    if (kfn_get_task_mm && kfn_follow_pte && kfn_spin_unlock) {
+        unsigned long mm_c0 =
+            ((unsigned long (*)(void *))kfn_get_task_mm)((void *)task);
+        unsigned long pa0 = 0;
+
+        CK_ERR("locate: get_task_mm=%lx\n", mm_c0);
+        if (mm_c0 && caoin_probe_walk(mm_c0, 0, va, expect_phys, &pa0)) {
+            unsigned long moff0 = 0, off0;
+
+            /* 反查 task_struct.mm 偏移：get_task_mm 返回的就是 task->mm，
+             * 在 task_struct 里找这个指针。mm_off=0 会让 caoin_is_target_proc
+             * 和 __switch_to 全部失效（5.10 真机实测：fault 被判成"非目标"
+             * 放行给原生路径 → 要么原生修回原页、要么原生自己活锁）。 */
+            for (off0 = 0x100; off0 < 0x1000; off0 += 8) {
+                unsigned long v0 = 0;
+
+                if (kfn_probe_read(&v0, (void *)(task + off0), 8))
+                    break;
+                if (v0 == mm_c0) {
+                    moff0 = off0;
+                    break;
+                }
+            }
+            CK_ERR("locate: via get_task_mm mm=%lx pte_a=%lx mm_off=%lx\n",
+                   mm_c0, pa0, moff0);
+            *mm_off_out = moff0;
+            *pgd_off_out = 0;
+            if (mm_out)
+                *mm_out = mm_c0;
+            if (pte_a_out)
+                *pte_a_out = pa0;
+            return 1;
+        }
+    }
+
+    /* 诊断：线性映射验证（RAM 起点 / 高段起点 / 此前 e0 值 / 超 RAM 值） */
+    {
+        static const unsigned long pas[4] = {0x40000000UL, 0x1C0000000UL,
+                                             0x23DCDB000UL, 0x337C95000UL};
+        int li;
+
+        for (li = 0; li < 4; li++) {
+            unsigned long lv = caoin_va(pas[li]);
+            unsigned long lval = 0;
+            long lr = kfn_probe_read(&lval, (void *)lv, 8);
+
+            CK_ERR("lin: pa=%lx va=%lx rc=%ld v=%lx\n",
+                   pas[li], lv, lr, lval);
+        }
+    }
+
+    /* 1) 精确 pgd_off（init_mm.pgd == swapper_pg_dir）→ 单层扫 mm_off */
+    if (caoin_locate_pgd_off(&fixed_pgd_off)) {
+        unsigned long pte_a = 0;
+
+        /* 诊断：用 init_mm（pgd 已知正确）walk 一个 vmalloc 地址（vmalloc
+         * 走 4K PTE）。成功 = 读页表方法可用，问题在 mm 偏移；失败 = 读法。 */
+        {
+            unsigned long im = (unsigned long)kallsyms_lookup_name("init_mm");
+
+            if (im) {
+                unsigned long mmc0 = 0, vpg = 0, pa0 = 0;
+
+                if (!kfn_probe_read(&mmc0, (void *)(task + 0x518), 8) &&
+                    !kfn_probe_read(&vpg, (void *)(mmc0 + fixed_pgd_off), 8) &&
+                    vpg) {
+                    /* 用 KPM 自己的函数地址（module 区，4K PTE，pgd 索引非用户区）
+                     * 作为测试目标——init_mm 在那里有真实映射。 */
+                    if (caoin_probe_walk(im, fixed_pgd_off, (unsigned long)kallsyms_lookup_name("init_mm"), 0, &pa0))
+                        CK_ERR("walk-test: self walk OK pte_a=%lx\n", pa0);
+                    else
+                        CK_ERR("walk-test: self walk FAILED\n");
+                }
+            }
+        }
+
+        /* 对比实验：内核 follow_pte（mm=init_mm，pgd 必然有效）拿真实 PTE，
+         * 与手工 walk 对比。 */
+        {
+            unsigned long im2 = (unsigned long)kallsyms_lookup_name("init_mm");
+            unsigned long pv2 = 0, pa2 = 0;
+
+            if (im2 && caoin_follow_pte_get(im2, im2, &pv2, &pa2)) {
+                unsigned long ph = 0;
+
+                if (kvar_memstart_addr && pa2)
+                    ph = (pa2 - page_offset_base) +
+                         (unsigned long)*kvar_memstart_addr;
+                CK_ERR("dump: follow_pte(init_mm) pte_a=%lx phys=%lx pte=%lx\n",
+                       pa2, ph, pv2);
+            } else {
+                CK_ERR("dump: follow_pte(init_mm) FAILED\n");
+            }
+        }
+
+        /* 1a) 已知 mm_off（vmlinux 的 init_task 静态布局推得：
+         * active_mm 在 +0x520 → mm 在 +0x518）→ 直接拿目标 mm 验证。
+         * init_task 运行时的 active_mm 会被借用（不再是 init_mm），
+         * 所以不能靠它现场推，只能用静态布局出的偏移。 */
+        {
+            unsigned long mm_c2 = 0, pte_v = 0, pte_a2 = 0;
+
+            if (!kfn_probe_read(&mm_c2, (void *)(task + 0x518), 8)) {
+                CK_ERR("locate: fixed mm_c=%lx\n", mm_c2);
+                if (mm_c2 && !(mm_c2 & 7) &&
+                    caoin_probe_walk(mm_c2, fixed_pgd_off, va, expect_phys,
+                                     &pte_a2)) {
+                    CK_ERR("locate: walk pte_a=%lx\n", pte_a2);
+                    if (kfn_probe_read(&pte_v, (void *)pte_a2, 8) == 0 &&
+                        (pte_v & 3) == 3 && (pte_v & PTE_UXN) == 0 &&
+                        (pte_v & PTE_AP_MASK) != 0 &&
+                        (pte_v & CAOIN_PFN_MASK) != 0) {
+                        CK_ERR("locate: fixed mm_off=0x518 ok\n");
+                        *mm_off_out = 0x518;
+                        *pgd_off_out = fixed_pgd_off;
+                        if (mm_out)
+                            *mm_out = mm_c2;
+                        if (pte_a_out)
+                            *pte_a_out = pte_a2;
+                        return 1;
+                    }
+                    CK_ERR("locate: follow_pte oracle fail\n");
+                }
+            }
+        }
+        /* 1b) 单层扫描：mm 候选的 pgd 字段（偏移已由 init_mm 精确得出）
+         * 必须是页对齐内核指针，再 walk 验证。task_struct 在 5.10+vendor
+         * 上可能很大，扫到 64KB。 */
+        for (moff = 8; moff < 0x10000; moff += 8) {
+            unsigned long pgd_v = 0;
+
+            if (kfn_probe_read(&mm_c, (void *)(task + moff), 8))
+                continue;
+            if (!mm_c || (mm_c & 7) || mm_c < page_offset_base)
+                continue;
+            if (kfn_probe_read(&pgd_v, (void *)(mm_c + fixed_pgd_off), 8))
+                continue;
+            if (!pgd_v || (pgd_v & 0xFFF) || pgd_v < page_offset_base)
+                continue;
+            if (caoin_probe_walk(mm_c, fixed_pgd_off, va, expect_phys, &pte_a)) {
+                CK_ERR("locate: mm_off=%lx pgd_off=%lx\n", moff, fixed_pgd_off);
+                *mm_off_out = moff;
+                *pgd_off_out = fixed_pgd_off;
+                if (mm_out)
+                    *mm_out = mm_c;
+                if (pte_a_out)
+                    *pte_a_out = pte_a;
+                return 1;
+            }
+        }
+    }
+    /* 2) 原暴力扫描 fallback */
+    for (moff = 0; moff < 0x4000; moff += 8) {
         if (kfn_probe_read(&mm_c, (void *)(task + moff), 8))
             continue;
         if (mm_c < page_offset_base || (mm_c & 0x7))
             continue;
-        for (poff = 0x20; poff < 0x400; poff += 8) {
+        mm_cands++;
+        if (mm_cands <= 3)
+            CK_ERR("locate: mmcand moff=%lx mm=%lx\n", moff, mm_c);
+        for (poff = 0x20; poff < 0x800; poff += 8) {
             if (kfn_probe_read(&pgd_p, (void *)(mm_c + poff), 8))
                 continue;
             if (pgd_p < page_offset_base || (pgd_p & 0xFFF))
                 continue;
+            pgd_cands++;
+            if (pgd_cands <= 3)
+                CK_ERR("locate: pgdcand poff=%lx pgd=%lx\n", poff, pgd_p);
             /* va2 是"第二个数据点"，用来交叉确认 mm/pgd 偏移。内核分配 status 页
              * 时没有用户 VA 可 walk（va2=0），跳过这层校验——主证据仍是 va 那次
              * walk（它本身就要求 tva 能经候选 mm/pgd 走到 PTE）。 */
-            if (caoin_probe_walk(mm_c, poff, va, expect_phys, pte_a_out)
-                && (!va2 || caoin_probe_walk(mm_c, poff, va2, expect2, 0))) {
+            if (caoin_probe_walk(mm_c, poff, va, expect_phys, pte_a_out)) {
+                unsigned long pte_v = 0;
+
+                walks++;
+                if (walks <= 3)
+                    CK_ERR("locate: walk ok moff=%lx poff=%lx pte_a=%lx\n",
+                           moff, poff, pte_a_out ? *pte_a_out : 0);
+                /* oracle 收紧：受管页是 EL0 可执行的 4K 页。随机数据要同时
+                 * 满足 valid+page、UXN=0、EL0 有权限、PFN 非零才算命中，
+                 * 误报概率远小于原来"present 即命中"。 */
+                if (!pte_a_out
+                    || kfn_probe_read(&pte_v, (void *)*pte_a_out, 8)
+                    || (pte_v & 3) != 3
+                    || (pte_v & PTE_UXN) != 0
+                    || (pte_v & PTE_AP_MASK) == 0
+                    || (pte_v & CAOIN_PFN_MASK) == 0) {
+                    oracle_fails++;
+                    if (oracle_fails <= 3)
+                        CK_ERR("locate: oracle fail pte=%lx\n", pte_v);
+                    continue;
+                }
+                if (va2 && !caoin_probe_walk(mm_c, poff, va2, expect2, 0))
+                    continue;
                 *mm_off_out = moff;
                 *pgd_off_out = poff;
                 if (mm_out)
@@ -1585,6 +2308,12 @@ static int caoin_locate(unsigned long task, unsigned long va, unsigned long expe
             }
         }
     }
+    CK_ERR("caoin-kpm: locate fail mmcand=%d pgdcand=%d walks=%d oracle_fail=%d "
+           "pageoff=%lx memstart=%lx task=%lx va=%lx\n",
+           mm_cands, pgd_cands, walks, oracle_fails,
+           page_offset_base,
+           kvar_memstart_addr ? (unsigned long)*kvar_memstart_addr : 0,
+           task, va);
     return 0;
 }
 
@@ -1672,6 +2401,9 @@ static void parse_args(const char *args)
         else if (!strncmp(p, "verbose=", 8)) g_verbose = parse_hex(p + 8);
         else if (!strncmp(p, "quiet=", 6)) g_quiet = parse_hex(p + 6);
         else if (!strncmp(p, "polymorph=", 10)) g_polymorph = parse_hex(p + 10);
+        else if (!strncmp(p, "tlbpage=", 8)) g_tlb_page = parse_hex(p + 8);
+        else if (!strncmp(p, "mprot=", 6)) cfg_mprot = parse_hex(p + 6);
+        else if (!strncmp(p, "mdeny=", 6)) cfg_mdeny = parse_hex(p + 6);
         else if (!strncmp(p, "stub=", 5)) g_stub_onload = parse_hex(p + 5);
         else if (!strncmp(p, "stubmode=", 9)) stub_mode = (int)parse_hex(p + 9);
         else if (!strncmp(p, "rearm=", 6)) g_rearm_on = parse_hex(p + 6);
@@ -1681,10 +2413,57 @@ static void parse_args(const char *args)
         else if (!strncmp(p, "capoff=", 7)) cfg_cap_off = parse_hex(p + 7);
         else if (!strncmp(p, "capmin=", 7)) cfg_cap_min = parse_hex(p + 7);
         else if (!strncmp(p, "captext=", 8)) cfg_cap_text = (int)parse_hex(p + 8);
+        else if (!strncmp(p, "injva=", 6)) cfg_injva = parse_hex(p + 6);
+        else if (!strncmp(p, "kalloc=", 7)) g_kalloc = parse_hex(p + 7);
+        else if (!strncmp(p, "injmax=", 7)) cfg_inj_max = parse_hex(p + 7);
+        else if (!strncmp(p, "injmin=", 7)) cfg_inj_min = parse_hex(p + 7);
+        else if (!strncmp(p, "injhex=", 7)) {
+            /* snippet：hex 编码的 Lua 源码（<= 4096 字节） */
+            const char *q = p + 7;
+            int n = 0;
+            while (q[0] && q[1] && n < (int)sizeof(inj_buf)) {
+                int hi = hexval(q[0]), lo = hexval(q[1]);
+                if (hi < 0 || lo < 0)
+                    break;
+                inj_buf[n++] = (unsigned char)((hi << 4) | lo);
+                q += 2;
+            }
+            inj_len = n;
+        }
+        else if (!strncmp(p, "injname=", 8)) {
+            /* chunk 名子串（hex 编码，<= 63 字节） */
+            const char *q = p + 8;
+            int n = 0;
+            while (q[0] && q[1] && n < (int)sizeof(inj_name)) {
+                int hi = hexval(q[0]), lo = hexval(q[1]);
+                if (hi < 0 || lo < 0)
+                    break;
+                inj_name[n++] = (unsigned char)((hi << 4) | lo);
+                q += 2;
+            }
+            inj_name_len = n;
+        }
+        else if (!strncmp(p, "injfind=", 8)) {
+            /* buffer 内容子串（hex 编码，<= 63 字节） */
+            const char *q = p + 8;
+            int n = 0;
+            while (q[0] && q[1] && n < (int)sizeof(inj_find)) {
+                int hi = hexval(q[0]), lo = hexval(q[1]);
+                if (hi < 0 || lo < 0)
+                    break;
+                inj_find[n++] = (unsigned char)((hi << 4) | lo);
+                q += 2;
+            }
+            inj_find_len = n;
+        }
         else if (!strncmp(p, "el0flip=", 8)) g_force_el0flip = parse_hex(p + 8);
         else if (!strncmp(p, "acct=", 5)) g_acct_on = parse_hex(p + 5);
-        else if (!strncmp(p, "rss=", 4)) g_rss_off = (unsigned long)parse_hex(p + 4);
+        else if (!strncmp(p, "rss=", 4)) {
+            g_rss_off = (unsigned long)parse_hex(p + 4);
+            g_rss_set = 1;
+        }
         else if (!strncmp(p, "msem=", 5)) g_mmap_sem_off = (unsigned long)parse_hex(p + 5);
+        else if (!strncmp(p, "vmm=", 4)) g_vma_mm_off = (unsigned long)parse_hex(p + 4);
         else if (!strncmp(p, "capfind=", 8)) {
             /* hex 解码后按 ',' 切分成多个关键字，例如
              * Damage,Hurt,LoseLife = 44616d6167652c487572742c4c6f73654c696665 */
@@ -1790,14 +2569,54 @@ static void exit_mmap_before(hook_fargs1_t *args, void *udata)
     mm_run_pgd = 0;
 }
 
+/* ---- follow_page_pte GUP 伴侣钩子 ----
+ * 读类 GUP（/proc/self/mem、process_vm_readv、ptrace PEEKTEXT、core dump）
+ * 经 follow_page_pte 拿页：SHADOW 的 PTE_SPECIAL 让 vm_normal_page 返回 NULL
+ * → follow_page_pte 返回 NULL → GUP 落 faultin_page → handle_mm_fault 按 VMA
+ * 权限（r-x，UXN=0）重写 PTE → 桩从此不再 fault，静默死。
+ * before 里把受管页翻 STEP：follow_page_pte 直接拿到**原页**（字节正确），
+ * UXN 保持 1 —— 下一个 EL0 取指 fault 翻回 SHADOW，跷跷板自愈，桩不死。
+ * 不需要 after：STEP 窗口内 EL0 读到的本来就是原页（读隐藏不变式）。
+ * FOLL_WRITE 交原生：写语义（COW/FORCE）不该被我们改。
+ * 锁：调用方（GUP）持有 mmap_sem 读锁，已排除 madvise/munmap 写者，
+ * 不能再 down_read（递归读锁遇排队写者会死锁），用无锁版 caoin_set_view。 */
+static void gup_pte_before(hook_fargs4_t *args, void *udata)
+{
+    u64 vma = args->arg0, addr = args->arg1, flags = args->arg3;
+    unsigned long mm = 0;
+    int hi;
+
+    (void)udata;
+    if (!vbar_on || !mm_run || !kfn_probe_read)
+        return;
+    for (hi = 0; hi < hooks_n; hi++)
+        if ((addr >> 12) == (hooks[hi].tva >> 12))
+            break;
+    if (hi >= hooks_n)
+        return;                       /* 不是受管页：绝大多数调用在这返回 */
+    if (flags & 1UL)                  /* FOLL_WRITE：写语义交原生 */
+        return;
+    if (kfn_probe_read(&mm, (void *)(vma + g_vma_mm_off), 8) || mm != mm_run)
+        return;                       /* 非目标 mm */
+    if (hooks[hi].cur_view != VIEW_SHADOW)
+        return;                       /* STEP：follow_page_pte 拿到的就是原页 */
+    CK_LOG("caoin-kpm: gup hit vma=%lx addr=%lx view=%d -> step\n",
+           vma, addr, (int)hooks[hi].cur_view);
+    caoin_set_view(hi, VIEW_STEP);
+    caoin_tlb_flush(hooks[hi].tva);
+    g_gup_cnt++;
+}
+
 /* ---- copy_process fork 防护（wxshadow 同款）----
  * fork 时 copy_process 快照父进程页表：受管页 PTE 若停在 SHADOW/STEP，
  * 子进程会继承 shadow 页 PFN，内核按 shadow 页记账子进程 RSS/rmap →
  * 后续 teardown 触发 "Bad rss-counter / Bad page map"。
  * 防护 = fork 前把受管页 PTE 恢复原值（pause），copy_process 返回后翻回
  * 原视图（resume）。只处理非 CLONE_VM（线程共享 mm，无页表快照）。
- * 状态经 args->local.data[0]（paused 标志）和 data[1..]（各 hook 视图）
- * 在 before/after 间传递（KP 保证同一次调用共享），并发 fork 不互相覆盖。
+ * 并发语义：g_fork_pause 是计数器——首个 fork 把各 hook 当前视图存进
+ * g_fork_view（此后 pause 期间无人再写它），args->local.data[0] 只做
+ * "本调用参与过" 标记；after 里只有把计数减到 0 的那个 fork 执行 resume，
+ * 保证 resume 不会插在其他 fork 的 copy_process 页表快照中间。
  * 与 caoin_fault_check 的并发：g_fork_pause > 0 期间 fault handler 不翻 PTE；
  * before 先置位并等 g_in_mh 归零，再恢复原 PTE。 */
 static void before_copy_process(hook_fargs8_t *args, void *udata)
@@ -1814,8 +2633,12 @@ static void before_copy_process(hook_fargs8_t *args, void *udata)
     if (!caoin_is_target_proc())     /* 只处理目标进程的 fork */
         return;
     args->local.data[0] = 1;
-    /* 先置 pause：新 fault 在 handler 里看到它就不再翻 PTE。 */
-    __atomic_add_fetch(&g_fork_pause, 1, __ATOMIC_ACQ_REL);
+    /* 首个 fork 保存视图到模块全局；后续 fork 不覆盖（此时 PTE 已被首者
+     * 恢复原页，视图没有新信息）。resume 由最后一个完成的 fork 执行。 */
+    if (__atomic_add_fetch(&g_fork_pause, 1, __ATOMIC_ACQ_REL) == 1) {
+        for (i = 0; i < hooks_n; i++)
+            g_fork_view[i] = hooks[i].cur_view;
+    }
     /* 等已经在 handler 里的线程退出（它们可能在 pause 之后把 PTE 翻回去）。
      * 有界自旋：handler 卡死时宁可保留小窗口，也不让 fork 挂住。 */
     for (spin = 0;
@@ -1823,8 +2646,6 @@ static void before_copy_process(hook_fargs8_t *args, void *udata)
          spin++)
         asm volatile("yield" ::: "memory");
     for (i = 0; i < hooks_n; i++) {
-        /* 视图存 per-invocation（local.data[1..]），并发 fork 不互相覆盖 */
-        args->local.data[1 + i] = hooks[i].cur_view;
         caoin_set_view_locked(i, VIEW_OFF);
         if (hooks[i].el0_pte_addr && hooks[i].el0_pte_addr != hooks[i].pte_addr)
             caoin_set_pte((u64 *)hooks[i].el0_pte_addr, hooks[i].orig_pte);
@@ -1841,16 +2662,329 @@ static void after_copy_process(hook_fargs8_t *args, void *udata)
     if (!args->local.data[0])
         return;
     args->local.data[0] = 0;
+    /* 只有最后一个完成的 fork 才 resume：此时所有并发 copy_process 都已
+     * 结束，页表快照不会再看到翻转态 PTE。 */
+    if (__atomic_sub_fetch(&g_fork_pause, 1, __ATOMIC_ACQ_REL) != 0)
+        return;
     for (i = 0; i < hooks_n; i++) {
-        u64 view = args->local.data[1 + i];
-
-        caoin_set_view_locked(i, view);
+        caoin_set_view_locked(i, g_fork_view[i]);
         if (!g_no_kpti || g_force_el0flip)
-            caoin_flip_el0(i, view, 1);
+            caoin_flip_el0(i, g_fork_view[i], 1);
     }
     caoin_tlb_flush(0);
-    __atomic_sub_fetch(&g_fork_pause, 1, __ATOMIC_ACQ_REL);
     CK_LOG("caoin-kpm: fork resume (%d hooks)\n", hooks_n);
+}
+
+/* ---- 5.10 版 fork 防护钩子 ----
+ * copy_process(pid, trace, node, kernel_clone_args)：clone_flags 在
+ * __clone3_args/__x64_sys_clone 传下来的 kernel_clone_args->flags（偏移 0），
+ * 不再像 4.9 的 _do_fork 那样是 arg0。 */
+static void before_copy_process4(hook_fargs4_t *args, void *udata)
+{
+    unsigned long ka = (unsigned long)args->arg3;
+    u64 clone_flags = 0;
+    int i, spin;
+
+    (void)udata;
+    args->local.data[0] = 0;
+    if (!vbar_on || !ka)
+        return;
+    if (kfn_probe_read(&clone_flags, (void *)ka, 8))
+        return;
+    if (clone_flags & CLONE_VM)      /* 线程：共享 mm，无页表快照 */
+        return;
+    if (!caoin_is_target_proc())     /* 只处理目标进程的 fork */
+        return;
+    args->local.data[0] = 1;
+    if (__atomic_add_fetch(&g_fork_pause, 1, __ATOMIC_ACQ_REL) == 1) {
+        for (i = 0; i < hooks_n; i++)
+            g_fork_view[i] = hooks[i].cur_view;
+    }
+    for (spin = 0;
+         spin < 100000 && __atomic_load_n(&g_in_mh, __ATOMIC_ACQUIRE) != 0;
+         spin++)
+        asm volatile("yield" ::: "memory");
+    for (i = 0; i < hooks_n; i++) {
+        caoin_set_view_locked(i, VIEW_OFF);
+        if (hooks[i].el0_pte_addr && hooks[i].el0_pte_addr != hooks[i].pte_addr)
+            caoin_set_pte((u64 *)hooks[i].el0_pte_addr, hooks[i].orig_pte);
+    }
+    caoin_tlb_flush(0);
+    CK_LOG("caoin-kpm: fork pause (%d hooks)\n", hooks_n);
+}
+
+static void after_copy_process4(hook_fargs4_t *args, void *udata)
+{
+    int i;
+
+    (void)udata;
+    if (!args->local.data[0])
+        return;
+    args->local.data[0] = 0;
+    if (__atomic_sub_fetch(&g_fork_pause, 1, __ATOMIC_ACQ_REL) != 0)
+        return;
+    for (i = 0; i < hooks_n; i++) {
+        caoin_set_view_locked(i, g_fork_view[i]);
+        if (!g_no_kpti || g_force_el0flip)
+            caoin_flip_el0(i, g_fork_view[i], 1);
+    }
+    caoin_tlb_flush(0);
+    CK_LOG("caoin-kpm: fork resume (%d hooks)\n", hooks_n);
+}
+
+/* ---- per-CPU 懒安装钩子（见 globals 处注释）----
+ * 只在切进目标 mm 的线程时动作，且每核一次；非目标进程的切换只多一次
+ * probe_read 就返回。mm_off 由 locate 探针得到（本机 0x5c8）。 */
+static void before_switch_to(hook_fargs2_t *args, void *udata)
+{
+    void *next = (void *)args->arg1;   /* 4.9: __switch_to(prev, next) */
+    unsigned long nmm = 0;
+    u64 key;
+    int i;
+
+    (void)udata;
+    if (!vbar_on || !hooks_n || !mm_run || !kfn_probe_read)
+        return;
+    if (!next)
+        return;
+    if (kfn_probe_read(&nmm, (void *)((unsigned long)next + mm_off), 8)
+        || nmm != mm_run)
+        return;
+    asm volatile("mrs %0, tpidr_el1" : "=r"(key));
+    for (i = 0; i < g_cpu_key_n; i++)
+        if (g_cpu_key[i] == key)
+            return;                    /* 本核已维护过 */
+    if (g_cpu_key_n >= (int)(sizeof(g_cpu_key) / sizeof(g_cpu_key[0])))
+        return;
+    g_cpu_key[g_cpu_key_n++] = key;
+    asm volatile("dsb ish" ::: "memory");
+    asm volatile("tlbi vmalle1" ::: "memory");   /* 本地版：本核非全局项 */
+    asm volatile("dsb ish" ::: "memory");
+    asm volatile("ic iallu" ::: "memory");       /* 本核 I-cache 全量失效 */
+    asm volatile("dsb ish" ::: "memory");
+    asm volatile("isb" ::: "memory");
+    g_cpu_armed_cnt++;
+    CK_LOG("caoin-kpm: per-cpu arm key=%lx n=%d\n",
+           (unsigned long)key, g_cpu_key_n);
+}
+
+/* ---- mprotect/madvise/mmap/munmap 感知钩子（见 globals 处注释）----
+ * which: 1=mprotect(arg2=prot) 2=madvise(arg2=advice) 3=mmap(arg2=flags,
+ * 仅 MAP_FIXED) 4=munmap。相交判定用原始 addr/len 半开区间——与内核
+ * start&~PAGE_MASK + PAGE_ALIGN(end) 后的范围逐边界等价。madvise 只记
+ * zap 类（DONTNEED=4/FREE=8），mmap 只记 MAP_FIXED(0x10)——提示式 mmap
+ * 内核未必落在该地址，记录没有意义。 */
+static int mp_hit_hook(u64 addr, u64 len)
+{
+    int hi;
+
+    for (hi = 0; hi < hooks_n; hi++) {
+        u64 pg = hooks[hi].tva & ~0xFFFUL;
+        if (addr < pg + 0x1000 && addr + len > pg)
+            return hi;
+    }
+    return -1;
+}
+
+/* 公共记录：返回环形 slot（after 回填 ret 用）。计数 + last 快照 + 环形
+ * 一条 + 限速打印。hit < 0 时只记全局（不该发生，防御）。denied=该次
+ * 被拦截（ret 是伪造的 0，不是真实 syscall 返回）。 */
+static int mp_record(u64 which, u64 addr, u64 len, u64 arg2, int hit,
+                     int denied)
+{
+    u64 seq = __atomic_add_fetch(&g_mp_seq, 1, __ATOMIC_RELAXED);
+    struct caoin_mrec *r = &g_mp_log[(seq - 1) % CAOIN_MPLOG];
+    int hi;
+
+    r->ts = kvar_jiffies ? (u64)*kvar_jiffies : 0;
+    r->which = which;
+    r->addr = addr;
+    r->len = len;
+    r->arg2 = arg2;
+    r->ret = 0;
+    r->view = hit >= 0 ? hooks[hit].cur_view : 0;
+    r->denied = denied;
+
+    if (which == 1) g_mprot_hits++;
+    else if (which == 2) g_madv_hits++;
+    else if (which == 3) g_mmap_hits++;
+    else g_munmap_hits++;
+    g_mp_which = which;
+    g_mp_addr = addr;
+    g_mp_len = len;
+    g_mp_arg2 = arg2;
+    for (hi = 0; hi < hooks_n; hi++)
+        g_mp_view[hi] = hooks[hi].cur_view;
+
+    if (which >= 1 && which <= 4 && g_mp_logn[which - 1] < 8) {
+        static const char *nm[4] =
+            { "mprotect", "madvise", "mmap", "munmap" };
+
+        g_mp_logn[which - 1]++;
+        CK_LOG("caoin-kpm: %s%s hit hook%d addr=%lx len=%lx arg2=%llx "
+               "view=%d\n",
+               nm[which - 1], denied ? " DENIED" : "", hit,
+               (unsigned long)addr, (unsigned long)len,
+               (unsigned long long)arg2,
+               hit >= 0 ? (int)hooks[hit].cur_view : -1);
+    }
+    return (int)((seq - 1) % CAOIN_MPLOG);
+}
+
+static void mp_after_fill(u64 slot, u64 ret)
+{
+    g_mp_ret = ret;
+    g_mp_log[slot].ret = ret;
+}
+
+static void mprot_before(hook_fargs3_t *args, void *udata)
+{
+    u64 addr = args->arg0, len = args->arg1, arg2 = args->arg2;
+    int is_madv = (udata != NULL);
+    int hit, denied;
+
+    args->local.data[0] = 0;
+    if (!cfg_mprot || !vbar_on || !hooks_n)
+        return;
+    if (is_madv && arg2 != 4 && arg2 != 8)
+        return;
+    hit = mp_hit_hook(addr, len);
+    if (hit < 0)
+        return;                       /* 不碰受管页：绝大多数调用在这返回 */
+    if (!caoin_is_target_proc())
+        return;
+    /* mdeny：吞掉 syscall，目标拿到 ret=0"成功"。这两类返回 0 语义完整；
+     * munmap/mmap FIXED 不拦（见 munmap_before 注释）。拦截对校验型目标
+     * 是完整解（桩活 + CRC 读原页照过）；对自修改型目标是灾难（后续写
+     * r-x 页 SIGSEGV）——所以默认关，先 mstat 观察目标行为。 */
+    denied = (cfg_mdeny != 0);
+    if (denied) {
+        args->skip_origin = 1;
+        args->ret = 0;
+        g_mdeny_hits++;
+    }
+    args->local.data[0] = 1;          /* after 里据此记 ret */
+    args->local.data[1] = (u64)mp_record(is_madv ? 2 : 1, addr, len, arg2,
+                                         hit, denied);
+}
+
+static void after_mprotect(hook_fargs3_t *args, void *udata)
+{
+    (void)udata;
+    if (args->local.data[0])
+        mp_after_fill(args->local.data[1], (u64)args->ret);
+}
+
+/* munmap/mmap FIXED 只感知不拦（即使 mdeny=1）：
+ * - munmap 吞掉后目标视角"已 unmap"，之后访问该地址期望 SIGSEGV——
+ *   却进了我们的 fault 翻转、访问"成功"，行为异常本身就是检测向量；
+ * - mmap FIXED 的返回值语义是地址，伪造返回值后目标写新映射必 SIGSEGV；
+ * - 且 munmap 单页不拆 PT、mmap FIXED 换 PTE 后 KPM 的 seesaw 自然停摆，
+ *   拦截收益远低于 mprotect/madvise。 */
+static void munmap_before(hook_fargs2_t *args, void *udata)
+{
+    u64 addr = args->arg0, len = args->arg1;
+    int hit;
+
+    (void)udata;
+    args->local.data[0] = 0;
+    if (!cfg_mprot || !vbar_on || !hooks_n)
+        return;
+    hit = mp_hit_hook(addr, len);
+    if (hit < 0)
+        return;
+    if (!caoin_is_target_proc())
+        return;
+    args->local.data[0] = 1;
+    args->local.data[1] = (u64)mp_record(4, addr, len, 0, hit, 0);
+}
+
+static void after_munmap(hook_fargs2_t *args, void *udata)
+{
+    (void)udata;
+    if (args->local.data[0])
+        mp_after_fill(args->local.data[1], (u64)args->ret);
+}
+
+static void mmap_before(hook_fargs6_t *args, void *udata)
+{
+    u64 addr = args->arg0, len = args->arg1, flags = args->arg3;
+    int hit;
+
+    (void)udata;
+    args->local.data[0] = 0;
+    if (!cfg_mprot || !vbar_on || !hooks_n)
+        return;
+    if (!(flags & 0x10))              /* 只记 MAP_FIXED */
+        return;
+    hit = mp_hit_hook(addr, len);
+    if (hit < 0)
+        return;
+    if (!caoin_is_target_proc())
+        return;
+    args->local.data[0] = 1;
+    args->local.data[1] = (u64)mp_record(3, addr, len, flags, hit, 0);
+}
+
+static void after_mmap(hook_fargs6_t *args, void *udata)
+{
+	(void)udata;
+	if (args->local.data[0])
+		mp_after_fill(args->local.data[1], (u64)args->ret);
+}
+
+/* ---- 5.10+ arm64 syscall wrapper 感知钩子 ----
+ * CONFIG_ARCH_HAS_SYSCALL_WRAPPER=y 的内核不再有 SyS_* 三参入口，
+ * 统一为 __arm64_sys_*(const struct pt_regs *regs)：参数在 regs->regs[0..]，
+ * 返回值在 regs->regs[0]（hook 框架的 args->ret 即 wrapper 返回值）。
+ * udata 携带类别：1=mprotect 2=madvise 3=mmap 4=munmap。 */
+static void wrap_before(hook_fargs1_t *args, void *udata)
+{
+	struct pt_regs_49 *regs = (struct pt_regs_49 *)(unsigned long)args->arg0;
+	u64 which = (u64)(unsigned long)udata;
+	u64 addr, len, arg2 = 0;
+	int hit, denied;
+
+	args->local.data[0] = 0;
+	if (!cfg_mprot || !vbar_on || !hooks_n || !regs)
+		return;
+	addr = regs->regs[0];
+	len = regs->regs[1];
+	switch (which) {
+	case 1:                       /* mprotect(start, len, prot) */
+	case 2:                       /* madvise(addr, len, advice) */
+		arg2 = regs->regs[2];
+		break;
+	case 3:                       /* mmap(addr, len, prot, flags, fd, off) */
+		arg2 = regs->regs[3];
+		if (!(arg2 & 0x10))       /* MAP_FIXED only */
+			return;
+		break;
+	default:                      /* munmap(addr, len) */
+		break;
+	}
+	if (which == 2 && arg2 != 4 && arg2 != 8)
+		return;                   /* madvise: zap 类 advice 才记录 */
+	hit = mp_hit_hook(addr, len);
+	if (hit < 0)
+		return;
+	if (!caoin_is_target_proc())
+		return;
+	denied = (cfg_mdeny && (which == 1 || which == 2));
+	if (denied) {
+		args->skip_origin = 1;
+		args->ret = 0;            /* syscall 直接返回 0（假装成功） */
+		g_mdeny_hits++;
+	}
+	args->local.data[0] = 1;
+	args->local.data[1] = (u64)mp_record(which, addr, len, arg2, hit, denied);
+}
+
+static void wrap_after(hook_fargs1_t *args, void *udata)
+{
+	(void)udata;
+	if (args->local.data[0])
+		mp_after_fill(args->local.data[1], (u64)args->ret);
 }
 
 /* ---- 卸载：非 hotpatch 摘链 ----
@@ -1918,7 +3052,47 @@ static long caoin_restore(void)
         if (em)
             caoin_unhook(em, exit_mmap_before, NULL);
         if (g_copy_process)
-            caoin_unhook(g_copy_process, before_copy_process, after_copy_process);
+            caoin_unhook(g_copy_process,
+                         g_copy4 ? (void *)before_copy_process4
+                                 : (void *)before_copy_process,
+                         g_copy4 ? (void *)after_copy_process4
+                                 : (void *)after_copy_process);
+        if (g_follow_pte) {
+            caoin_unhook(g_follow_pte, gup_pte_before, NULL);
+            g_follow_pte = 0;
+        }
+        if (g_switch_to) {
+            caoin_unhook(g_switch_to, before_switch_to, NULL);
+            g_switch_to = NULL;
+        }
+        if (g_mprot) {
+            caoin_unhook(g_mprot, g_mprot_wrap ? (void *)wrap_before
+                                               : (void *)mprot_before,
+                         g_mprot_wrap ? (void *)wrap_after
+                                      : (void *)after_mprotect);
+            g_mprot = NULL;
+        }
+        if (g_madv) {
+            caoin_unhook(g_madv, g_madv_wrap ? (void *)wrap_before
+                                             : (void *)mprot_before,
+                         g_madv_wrap ? (void *)wrap_after
+                                     : (void *)after_mprotect);
+            g_madv = NULL;
+        }
+        if (g_munmap) {
+            caoin_unhook(g_munmap, g_munmap_wrap ? (void *)wrap_before
+                                                 : (void *)munmap_before,
+                         g_munmap_wrap ? (void *)wrap_after
+                                       : (void *)after_munmap);
+            g_munmap = NULL;
+        }
+        if (g_mmap) {
+            caoin_unhook(g_mmap, g_mmap_wrap ? (void *)wrap_before
+                                             : (void *)mmap_before,
+                         g_mmap_wrap ? (void *)wrap_after
+                                     : (void *)after_mmap);
+            g_mmap = NULL;
+        }
         g_hooks_installed = 0;
     }
     if (alive)
@@ -1934,6 +3108,14 @@ static long caoin_restore(void)
         for (i = 0; i < hooks_n; i++)
             if (hooks[i].cur_view != VIEW_OFF)
                 safe = 0;
+        /* 目标存活时即使视图已 OFF 也不释放：cur_view 是软件状态，
+         * 不保证目标核 TLB 里没有残留的影子翻译（5.10 实测：卸载后目标
+         * 下次取指卡死，疑似 stale TLB + 已释放页被复用）。泄漏 4K 换安全。 */
+        if (alive && safe) {
+            CK_ERR("caoin-kpm: target alive -> kernel pages leaked "
+                   "(avoid stale-TLB UAF)\n");
+            safe = 0;
+        }
         if (!safe) {
             CK_ERR("caoin-kpm: PTE state not OFF -> kernel pages leaked (avoid UAF)\n");
         } else if (kfn_free_pages) {
@@ -1961,12 +3143,24 @@ static long caoin_restore(void)
     /* 并发插桩收尾：卸载时无条件打一次（不依赖 ctl0）。
      * overlap > 0 且 desync_a/b == 0 → 并发进入确实发生过、且没脱同步。 */
     CK_ERR("caoin-kpm: conc entries=%llu overlap=%llu desync_a=%llu desync_b=%llu "
-           "rearm_on=%llu rearm_cnt=%llu selfread_ok=%llu fb=%llu\n",
+           "rearm_on=%llu rearm_cnt=%llu selfread_ok=%llu fb=%llu gup=%llu "
+           "sent=%llu inj=%llu mprot=%llu madv=%llu munmap=%llu mmap=%llu "
+           "acct0=%llu acct1=%llu\n",
            (unsigned long long)g_entries, (unsigned long long)g_overlap,
            (unsigned long long)g_desync_a, (unsigned long long)g_desync_b,
            (unsigned long long)g_rearm_on, (unsigned long long)g_rearm_cnt,
            (unsigned long long)selfread_ok_cnt,
-           (unsigned long long)selfread_fb_cnt);
+           (unsigned long long)selfread_fb_cnt,
+           (unsigned long long)g_gup_cnt,
+           (unsigned long long)sent_cnt, (unsigned long long)inj_cnt,
+           (unsigned long long)g_mprot_hits, (unsigned long long)g_madv_hits,
+           (unsigned long long)g_munmap_hits,
+           (unsigned long long)g_mmap_hits,
+           (unsigned long long)g_acct_n0, (unsigned long long)g_acct_n1);
+    if (kfn_mmput && mm_run) {
+        ((void (*)(void *))kfn_mmput)((void *)mm_run);
+        mm_run = 0;
+    }
     CK_LOG("caoin-kpm: off, restored (%d hooks)\n", hooks_n);
     return 0;
 }
@@ -2036,12 +3230,20 @@ static void caoin_install_minstore(int hi)
     unsigned long pte_a = 0, pte_v = 0, kva, report;
     volatile u32 *stub;
     u64 magic = caoin_magic(0xCA0FCA51ULL);
+    int lk = caoin_mm_lock();
 
     if (!caoin_walk_pgd_via_mm(h->shva, &pte_a)
         || kfn_probe_read(&pte_v, (void *)pte_a, 8)
         || !(pte_v & CAOIN_PFN_MASK))
-        { CK_ERR("caoin-kpm: hook%d minstore walk fail\n", hi); return; }
+        {
+            if (lk)
+                caoin_mm_unlock();
+            CK_ERR("caoin-kpm: hook%d minstore walk fail\n", hi);
+            return;
+        }
     kva = caoin_va(pte_v & CAOIN_PFN_MASK) + h->shva_off;
+    if (lk)
+        caoin_mm_unlock();
     report = h->shva + 0xF00;
     stub = (volatile u32 *)kva;
     stub[0] = 0xD2800000u | ((u32)((report >> 0)  & 0xFFFF) << 5) | 16;
@@ -2252,6 +3454,194 @@ static void status_mark(u64 v)
     asm volatile("dc civac, %0" :: "r"(statusp) : "memory");
 }
 
+/* 在 near 附近找一块真实空洞（±64MB 内，VMA 链表验证过）。
+ * 背景：vm_mmap 只给 hint 时，topdown 分配器的 fast-path 只接受
+ * mmap_base 之上的 hint（代码：if (mm->mmap_base <= addr && ...)），
+ * tva 附近的 hint 一律被拒，回退到 mmap_base 附近（实测 ~14GB 外）。
+ * 入口桩 ADRP / 重定位展开都要求 status 页在 tva ±4GB 内，所以必须
+ * 自己走 VMA 链表找洞，再用 MAP_FIXED 精确落位。
+ * vm_area_struct(4.9): vm_start@0 vm_end@8 vm_next@0x10 vm_prev@0x18。 */
+static unsigned long caoin_near_slot(unsigned long near, unsigned long len)
+{
+    unsigned long tva_page = near & ~0xFFFUL;
+    unsigned long best = 0, best_d = ~0UL;
+    unsigned long vma, v;
+    int i;
+
+    if (!kfn_find_vma || !kfn_probe_read || !mm_run)
+        return 0;
+    vma = (unsigned long)kfn_find_vma((void *)mm_run, tva_page);
+    if (!vma) {
+        CK_ERR("caoin-kpm: near: find_vma(%lx) null\n",
+               (unsigned long)tva_page);
+        return 0;
+    }
+    {
+        unsigned long s0 = 0, e0 = 0, n0 = 0;
+        kfn_probe_read(&s0, (void *)vma, 8);
+        kfn_probe_read(&e0, (void *)(vma + 8), 8);
+        kfn_probe_read(&n0, (void *)(vma + 0x10), 8);
+        CK_LOG("caoin-kpm: near: vma=%lx [%lx-%lx] next=%lx\n",
+               vma, s0, e0, n0);
+    }
+    /* 向后：prev->vm_end .. next->vm_start 之间的洞 */
+    v = vma;
+    for (i = 0; i < 4096 && v; i++) {
+        unsigned long next = 0, end = 0, nstart = 0, cand, d;
+        long r1, r2;
+
+        r1 = kfn_probe_read(&next, (void *)(v + 0x10), 8);
+        if (r1 || !next) {
+            if (i < 2)
+                CK_LOG("caoin-kpm: near: i=%d next rd=%ld v=%lx\n",
+                       i, r1, v);
+            break;
+        }
+        r2 = kfn_probe_read(&end, (void *)(v + 0x8), 8);
+        if (!r2)
+            r2 = kfn_probe_read(&nstart, (void *)next, 8);
+        if (r2) {
+            if (i < 2)
+                CK_LOG("caoin-kpm: near: i=%d fld rd=%ld next=%lx\n",
+                       i, r2, next);
+            break;
+        }
+        if (i < 2)
+            CK_LOG("caoin-kpm: near: i=%d end=%lx nstart=%lx\n",
+                   i, end, nstart);
+        cand = (end + 0xFFFUL) & ~0xFFFUL;
+        if (nstart > cand && nstart - cand >= len) {
+            d = cand > tva_page ? cand - tva_page : tva_page - cand;
+            if (d <= 0xE0000000UL && d < best_d) {
+                best_d = d;
+                best = cand;
+            }
+        }
+        v = next;
+    }
+    /* 向前：vm_prev 链 */
+    v = vma;
+    for (i = 0; i < 4096 && v; i++) {
+        unsigned long prev = 0, cstart = 0, pend = 0, cand, d;
+
+        if (kfn_probe_read(&prev, (void *)(v + 0x18), 8) || !prev)
+            break;
+        if (kfn_probe_read(&cstart, (void *)v, 8)
+            || kfn_probe_read(&pend, (void *)(prev + 0x8), 8))
+            break;
+        if (cstart > pend && cstart - pend >= len) {
+            cand = cstart - len;       /* 洞的末尾 */
+            d = cand > tva_page ? cand - tva_page : tva_page - cand;
+            if (d <= 0xE0000000UL && d < best_d) {
+                best_d = d;
+                best = cand;
+            }
+        }
+        v = prev;
+    }
+    return best;
+}
+
+/* ---- kalloc：在目标 fault 上下文建页 + 装桩（无 ptrace 模式）----
+ * 调用点保证 current 是目标线程（mm 正确）。先清 pending 再碰内存：
+ * copy_to_user 触发的 fault-in 会再次进入 do_page_fault hook，不能递归。 */
+static void caoin_kalloc_pages(void)
+{
+    unsigned long sva = 0;
+    u64 z = 0;
+    int i;
+
+    g_pending_kalloc = 0;
+    if (!kfn_vm_mmap || !kfn_copy_to_user) {
+        CK_ERR("caoin-kpm: kalloc: vm_mmap/copy_to_user missing\n");
+        return;
+    }
+    /* mmap_sem 被持有（GUP 类 fault 上下文）时不能 down_write，推迟到下次 */
+    {
+        unsigned long sem = 0;
+        if (!kfn_probe_read(&sem, (void *)(mm_run + g_mmap_sem_off), 8)
+            && sem != 0) {
+            g_pending_kalloc = 1;
+            return;
+        }
+    }
+    /* status 页必须落在 tva 附近（入口桩 ADRP ±4GB / 重定位展开 ±4GB）。
+     * 先走 VMA 链表找近洞，再 MAP_FIXED 精确落位。启动早期游戏在疯狂
+     * mmap，无锁遍历可能读到瞬态 → 找不到近槽就推迟到下次 fault 重试
+     * （最多 32 次），而不是回退到 15GB 外的默认分配。 */
+    {
+        unsigned long slot;
+        int lk = caoin_mm_lock();      /* 遍历期间拿 mmap_sem 读锁 */
+
+        slot = caoin_near_slot(hooks[0].tva, 0x1000);
+        if (lk)
+            caoin_mm_unlock();
+        if (!slot) {
+            if (g_kalloc_tries < 32) {
+                g_kalloc_tries++;
+                g_pending_kalloc = 1;  /* 下次目标 fault 再试 */
+                return;
+            }
+            CK_ERR("caoin-kpm: kalloc: no near slot after %d tries\n",
+                   g_kalloc_tries);
+        }
+        if (slot)
+            sva = kfn_vm_mmap((void *)0, slot, 0x1000, 3 /* RW */,
+                              0x32 /* FIXED|PRIVATE|ANON */, 0);
+        else
+            sva = kfn_vm_mmap((void *)0, hooks[0].tva & ~0xFFFUL, 0x1000,
+                              3, 0x22, 0);
+    }
+    if ((long)sva < 0) {
+        CK_ERR("caoin-kpm: kalloc: vm_mmap status fail %ld\n", (long)sva);
+        return;
+    }
+    cfg_sva = sva;
+    cfg_e2 = 0;
+    if (kfn_copy_to_user((void *)cfg_sva, &z, 8)) {
+        CK_ERR("caoin-kpm: kalloc: status touch fail va=%lx\n",
+               (unsigned long)cfg_sva);
+        return;
+    }
+    {   /* fault-in 后 walk 才能拿到 PFN（write_status 内核线性路径要用） */
+        unsigned long pte_a = 0;
+        u64 pte_v = 0;
+        if (caoin_walk_pgd_via_mm(cfg_sva, &pte_a)
+            && !kfn_probe_read(&pte_v, (void *)pte_a, 8))
+            cfg_e2 = pte_v & CAOIN_PFN_MASK;
+    }
+    if (cfg_e2)
+        caoin_write_status(0, 0x7);
+    if (inj_len) {
+        unsigned long slot = caoin_near_slot(hooks[0].tva, 0x2000);
+        unsigned long injva = kfn_vm_mmap((void *)0,
+                                          slot ? slot : (hooks[0].tva & ~0xFFFUL),
+                                          0x2000, 3,
+                                          slot ? 0x32 : 0x22, 0);
+        if ((long)injva < 0) {
+            CK_ERR("caoin-kpm: kalloc: vm_mmap inj fail %ld\n", (long)injva);
+        } else {
+            cfg_injva = injva;
+            if (kfn_copy_to_user((void *)cfg_injva, &z, 8))
+                CK_ERR("caoin-kpm: kalloc: inj touch fail va=%lx\n",
+                       (unsigned long)cfg_injva);
+        }
+    }
+    /* 目标 fault 上下文装桩：install 核 = 目标核，ic iallu 本核生效 */
+    for (i = 0; i < hooks_n; i++) {
+        if (stub_mode == 0)
+            caoin_install_stub(i);
+        else if (stub_mode == 1)
+            caoin_install_minstore(i);
+        else
+            caoin_install_recstub(i);
+    }
+    CK_ERR("caoin-kpm: kalloc done sva=%lx e2=%llx injva=%lx d=%lldMB\n",
+           (unsigned long)cfg_sva, (unsigned long long)cfg_e2,
+           (unsigned long)cfg_injva,
+           (long long)((s64)cfg_sva - (s64)(hooks[0].tva & ~0xFFFUL)) >> 20);
+}
+
 /* ---- KPM 入口 ---- */
 
 static long caoin_init(const char *args, const char *event, void *__user reserved)
@@ -2301,14 +3691,57 @@ static long caoin_init(const char *args, const char *event, void *__user reserve
         u64 tcr, t1sz;
         asm volatile("mrs %0, tcr_el1" : "=r"(tcr));
         t1sz = (tcr >> 16) & 0x3f;
+        g_va_bits = (unsigned int)(64 - t1sz);
         page_offset_base = ~0UL << (64 - t1sz - 1);
         CK_LOG("caoin-kpm: tcr=%lx t1sz=%llu page_off=%lx\n",
                (unsigned long)tcr, (unsigned long long)t1sz,
                page_offset_base);
     }
     kvar_memstart_addr = (s64 *)kallsyms_lookup_name("memstart_addr");
+    /* mstat 时间轴用；解析不到只是 ts=0，不影响功能 */
+    kvar_jiffies = (volatile unsigned long *)kallsyms_lookup_name("jiffies");
     kfn_probe_read = (void *)kallsyms_lookup_name("probe_kernel_read");
+    if (!kfn_probe_read)   /* 5.8+ renamed; 5.10 has only this name */
+        kfn_probe_read = (void *)kallsyms_lookup_name("copy_from_kernel_nofault");
     kfn_probe_write = (void *)kallsyms_lookup_name("probe_kernel_write");
+    if (!kfn_probe_write)
+        kfn_probe_write = (void *)kallsyms_lookup_name("copy_to_kernel_nofault");
+    /* 内核代际：linux_banner 的大版本号决定 struct page 布局 */
+    {
+        const char *b = (const char *)kallsyms_lookup_name("linux_banner");
+        char buf[32] = {0};
+
+        if (b && kfn_probe_read
+            && kfn_probe_read(buf, (void *)b, sizeof(buf) - 1) == 0) {
+            char *v = buf;
+            int maj = 0;
+
+            while (*v && (*v < '0' || *v > '9'))
+                v++;
+            while (*v >= '0' && *v <= '9') {
+                maj = maj * 10 + (*v - '0');
+                v++;
+            }
+            g_kver5 = (maj >= 5);
+            if (g_kver5) {
+                g_page_ref_off = 0x34;
+                /* 5.10 arm64 的 mm_rss_stat 在 0x2d8（saved_auxv[46] 之后；
+                 * 4.9 是 0x2b0）。已用 /proc/pid/statm 的 resident 对过：
+                 * file+anon+swap+shmem == statm resident。rss= 显式覆盖。 */
+                if (!g_rss_set)
+                    g_rss_off = 0x2d8;
+            }
+            CK_LOG("caoin-kpm: banner=%.24s maj=%d refoff=%x\n",
+                   buf, maj, g_page_ref_off);
+        }
+    }
+    /* 5.10+：用内核 follow_pte 走页表（手工 walk 在 KASAN_HW_TAGS 内核上
+     * 读页表会 fault）；成功后必须 _raw_spin_unlock 释放 pte 页锁。 */
+    kfn_follow_pte = (void *)kallsyms_lookup_name("follow_pte");
+    kfn_spin_unlock = (void *)kallsyms_lookup_name("_raw_spin_unlock");
+    kfn_get_task_mm = (void *)kallsyms_lookup_name("get_task_mm");
+    kfn_mmput = (void *)kallsyms_lookup_name("mmput");
+    kfn_virt_to_phys = (void *)kallsyms_lookup_name("__virt_to_phys");
     kfn_find_task_by_vpid = (void *)kallsyms_lookup_name("find_task_by_vpid");
     kfn_get_free_pages = (void *)kallsyms_lookup_name("__get_free_pages");
     kfn_free_pages = (void *)kallsyms_lookup_name("free_pages");
@@ -2318,6 +3751,19 @@ static long caoin_init(const char *args, const char *event, void *__user reserve
     kfn___put_page = (void *)kallsyms_lookup_name("__put_page");
     kfn_down_read = (void *)kallsyms_lookup_name("down_read");
     kfn_up_read = (void *)kallsyms_lookup_name("up_read");
+    kfn_down_write = (void *)kallsyms_lookup_name("down_write");
+    kfn_up_write = (void *)kallsyms_lookup_name("up_write");
+    kfn_do_munmap = (void *)kallsyms_lookup_name("do_munmap");
+    if (g_kalloc) {
+        kfn_vm_mmap = (void *)kallsyms_lookup_name("vm_mmap");
+        kfn_get_unmapped_area = (void *)kallsyms_lookup_name("get_unmapped_area");
+        kfn_find_vma = (void *)kallsyms_lookup_name("find_vma");
+        if (!kfn_vm_mmap || !kfn_down_write || !kfn_up_write) {
+            CK_ERR("caoin-kpm: kalloc symbols missing (vm_mmap=%lx dw=%lx)\n",
+                   (unsigned long)kfn_vm_mmap, (unsigned long)kfn_down_write);
+            return -1;
+        }
+    }
     if (!kvar_memstart_addr || !kfn_probe_read || !kfn_find_task_by_vpid) {
         CK_ERR("caoin-kpm: symbol resolve failed (memstart=%lx probe=%lx find=%lx)\n",
                (unsigned long)kvar_memstart_addr,
@@ -2371,7 +3817,7 @@ static long caoin_init(const char *args, const char *event, void *__user reserve
     /* status 页下沉：没有用户态 sva 就在内核分配。
      * 必须在第一次 caoin_write_status 之前把 cfg_e2 定好——否则 cfg_sva=0 时
      * caoin_write_status 会去 walk VA=0 的 PTE，那是完全错误的目标地址。 */
-    if (!cfg_sva) {
+    if (!cfg_sva && !g_kalloc) {
         if (!kfn_get_free_pages) {
             CK_ERR("caoin-kpm: no sva provided and __get_free_pages unavailable\n");
             return -1;
@@ -2381,10 +3827,14 @@ static long caoin_init(const char *args, const char *event, void *__user reserve
             CK_ERR("caoin-kpm: kstatus alloc failed\n");
             return -1;
         }
+        /* PAGE_OFFSET 探测（kstatus 路径复核；正常已在 locate 前用 task 做过） */
+        caoin_fix_page_offset((unsigned long)kstatus);
         cfg_e2 = caoin_pa(kstatus) & CAOIN_PFN_MASK;
         CK_ERR("caoin-kpm: kstatus=%lx pfn=%lx (kernel-allocated, no VMA)\n",
                (unsigned long)kstatus, (unsigned long)cfg_e2);
     }
+    if (g_kalloc)
+        g_pending_kalloc = 1;   /* 首次目标 fault 时建页 + 装桩 */
 
     task = kfn_find_task_by_vpid((int)cfg_pid);
     if (!task) {
@@ -2392,6 +3842,10 @@ static long caoin_init(const char *args, const char *event, void *__user reserve
                (unsigned long long)cfg_pid);
         return -1;
     }
+    /* 先修 PAGE_OFFSET（task 是已知线性映射内核 VA）。不能拖到 status 页
+     * 分支——用户态 sva 路径不分配 kstatus，否则 caoin_va 用错误基址
+     * （真机实测：stub 写到 0xffffffc2... 未映射区 → oops）。 */
+    caoin_fix_page_offset((unsigned long)task);
 
     /* hook0 定位（拿 mm_off/pgd_off/mm_run；其余 hook 复用同一 mm/pgd） */
     if (!caoin_locate((unsigned long)task, hooks[0].tva, 0,
@@ -2413,8 +3867,9 @@ static long caoin_init(const char *args, const char *event, void *__user reserve
     CK_LOG("caoin-kpm: combo locked mm=%lx pgd=%lx pte=%lx\n",
            mm_off_out, pgd_off_out, pte_a);
 
-    /* rss_stat 偏移自检：mm+0x2b0 是 __mmdrop 里 check_mm 反汇编得到的
-     * MM_FILEPAGES 计数器。偏移错的话读出来是垃圾，直接关掉记账。 */
+    /* rss_stat 偏移自检：4.9 在 0x2b0、5.10 在 0x2d8（saved_auxv 之后）。
+     * 偏移错时的典型表现是全 0（读到 saved_auxv 尾部）——活进程的四个
+     * 计数器之和必 > 0（code/stack/heap 至少占一项），据此兜底关记账。 */
     if (g_acct_on) {
         long c0 = 0, c1 = 0, c2 = 0, c3 = 0;
         if (kfn_probe_read(&c0, (void *)(mmv + g_rss_off), 8)
@@ -2422,7 +3877,8 @@ static long caoin_init(const char *args, const char *event, void *__user reserve
             || kfn_probe_read(&c2, (void *)(mmv + g_rss_off + 16), 8)
             || kfn_probe_read(&c3, (void *)(mmv + g_rss_off + 24), 8)
             || c0 < 0 || c0 > (1L << 40) || c1 < 0 || c1 > (1L << 40)
-            || c2 < 0 || c2 > (1L << 40) || c3 < 0 || c3 > (1L << 40)) {
+            || c2 < 0 || c2 > (1L << 40) || c3 < 0 || c3 > (1L << 40)
+            || (c0 + c1 + c2 + c3) == 0) {
             g_acct_on = 0;
             CK_ERR("caoin-kpm: rss_stat off=%lx sanity fail "
                    "(c=%ld,%ld,%ld,%ld), acct off\n",
@@ -2439,6 +3895,25 @@ static long caoin_init(const char *args, const char *event, void *__user reserve
         if (caoin_probe_walk(mmv, pgd_off_out, cfg_sva, 0, &stpte)
             && !kfn_probe_read(&stv, (void *)stpte, 8))
             cfg_e2 = stv & CAOIN_PFN_MASK;
+    }
+
+    /* 临时诊断：dump mm 0x2a0..0x320，用 /proc/pid/statm 的 resident
+     * 页数对出 rss_stat 的真实偏移（5.10 的 AT_VECTOR_SIZE 依赖 arch）。 */
+    if (g_kver5 && g_verbose && mmv) {
+        int di;
+
+        for (di = 0; di < 16; di += 4) {
+            u64 d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+
+            kfn_probe_read(&d0, (void *)(mmv + 0x2a0 + di * 8), 8);
+            kfn_probe_read(&d1, (void *)(mmv + 0x2a8 + di * 8), 8);
+            kfn_probe_read(&d2, (void *)(mmv + 0x2b0 + di * 8), 8);
+            kfn_probe_read(&d3, (void *)(mmv + 0x2b8 + di * 8), 8);
+            CK_ERR("caoin-kpm: mmdump +%lx: %llx %llx %llx %llx\n",
+                   0x2a0UL + di * 8, (unsigned long long)d0,
+                   (unsigned long long)d1, (unsigned long long)d2,
+                   (unsigned long long)d3);
+        }
     }
 
     /* 逐 hook：orig PTE / phys 自推导 / shadow+origview PTE 值 */
@@ -2490,6 +3965,30 @@ static long caoin_init(const char *args, const char *event, void *__user reserve
                (int)(h->ret_val & 0xFFFF));
     }
 
+    /* struct page 布局自检（只读）：5.10 的 _mapcount/_refcount/memcg 期望
+     * 在 0x30/0x34/0x38。ref 应是小的正数，memcg 是 0 或内核指针。
+     * 数字明显不是这个形态 → 后面 acct 会写坏 page cache，必须先停。 */
+    if (g_kver5 && hooks_n && hooks[0].orig_pfn && kvar_memstart_addr) {
+        unsigned long pg = (unsigned long)caoin_pfn_to_page(hooks[0].orig_pfn);
+        u64 pflags = 0, pmc = 0;
+        u32 pmap = 0, pref = 0;
+
+        kfn_probe_read(&pflags, (void *)pg, 8);
+        kfn_probe_read(&pmap, (void *)(pg + 0x30), 4);
+        kfn_probe_read(&pref, (void *)(pg + 0x34), 4);
+        kfn_probe_read(&pmc, (void *)(pg + 0x38), 8);
+        CK_ERR("caoin-kpm: pgcheck pg=%lx flags=%llx map=%x ref=%x "
+               "memcg=%llx\n", pg, pflags, pmap, pref, pmc);
+        /* 形态不对就别记账（宁可记账失真，不能写坏 page）。
+         * map 上限 0x10000：正常映射页的 mapcount 是个位/十位数，
+         * 超过说明之前跑过脱同步不平衡的记账（实测漂移 = acct1-acct0）。 */
+        if (pref == 0 || pref > 0x1000 || pmap > 0x1000
+            || (pmc && pmc < 0xffffff8000000000UL)) {
+            g_acct_on = 0;
+            CK_ERR("caoin-kpm: pgcheck abnormal -> acct off\n");
+        }
+    }
+
     /* KPTI 副本兜底扫描：只对 hook0 做一次性扫描（本机 TTBR0==mm->pgd 无副本；
      * 若找到 pte_addr2，其余 hook 在同一张副本表里 walk 同表得各自 PTE） */
     hooks[0].pte_addr2 = 0;
@@ -2500,7 +3999,10 @@ static long caoin_init(const char *args, const char *event, void *__user reserve
                 continue;
             if (upgd < page_offset_base || (upgd & 0xFFF))
                 continue;
-            if (!caoin_probe_walk(mmv + off, 0, hooks[0].tva, 0, &uptea))
+            /* 这里 upgd 是候选 pgd 指针，不是 mm。caoin_probe_walk 现在
+             * 优先走 follow_pte(mm,...)——传假 mm 会内核崩溃，必须用
+             * 手工 walk（PAGE_OFFSET 已修正，caoin_va 可用）。 */
+            if (!caoin_walk_pgd(caoin_va(upgd), hooks[0].tva, &uptea))
                 continue;
             if (!kfn_probe_read(&uppte, (void *)uptea, 8))
                 continue;
@@ -2572,23 +4074,204 @@ static long caoin_init(const char *args, const char *event, void *__user reserve
         }
         CK_LOG("caoin-kpm: exit_mmap hooked @%lx\n", (unsigned long)em);
     }
-    /* fork 防护（安全增强，可选）：装不上只 warn——缺它不影响主链路，
-     * 只在目标 fork 时留 RSS 记账风险（见 before_copy_process 注释）。 */
+    /* fork 防护（安全增强）：4.9 的 copy_process 是 8 参
+     * (clone_flags, stack, ...)，5.10 改成 4 参 (pid, trace, node,
+     * kernel_clone_args)。按内核代际选 hook_wrap8/4；卸载时必须用同一对
+     * before/after 摘链（用错会留悬挂项 → 下次 fork 跳已释放模块）。 */
     {
+        hook_err_t e2;
+
         g_copy_process = (void *)(unsigned long)kallsyms_lookup_name("copy_process");
         if (g_copy_process) {
-            hook_err_t e2 = hook_wrap8(g_copy_process, before_copy_process,
-                                       after_copy_process, NULL);
+            if (g_kver5) {
+                g_copy4 = 1;
+                e2 = hook_wrap4(g_copy_process, before_copy_process4,
+                                after_copy_process4, NULL);
+            } else {
+                e2 = hook_wrap8(g_copy_process, before_copy_process,
+                                after_copy_process, NULL);
+            }
             if (e2 != HOOK_NO_ERR) {
                 CK_ERR("caoin-kpm: hook copy_process fail err=%d (fork 防护关闭)\n", e2);
                 g_copy_process = NULL;
+                g_copy4 = 0;
             } else {
-                CK_LOG("caoin-kpm: copy_process hooked @%lx (fork 防护开)\n",
-                       (unsigned long)g_copy_process);
+                CK_LOG("caoin-kpm: copy_process hooked @%lx (fork 防护开, %s)\n",
+                       (unsigned long)g_copy_process, g_kver5 ? "4 参" : "8 参");
             }
         } else {
             CK_ERR("caoin-kpm: copy_process not found (fork 防护关闭)\n");
         }
+    }
+    /* GUP 伴侣钩子（可选）：装不上只 warn——缺它不影响主链路，
+     * 只在读类 GUP 打到受管页时桩可能被 PTE 修复静默打死。
+     * 符号回退：4.9 的 follow_page_pte 是 static（真机 kallsyms 无此符号），
+     * 退到 follow_page_mask（全局；参数布局相同，arg3 同为 flags，
+     * 且涵盖 pmd/pud 大页分支）。慢路径 GUP 都经过它。 */
+    {
+        g_follow_pte = (void *)(unsigned long)kallsyms_lookup_name("follow_page_pte");
+        if (!g_follow_pte)
+            g_follow_pte = (void *)(unsigned long)kallsyms_lookup_name("follow_page_mask");
+        if (g_follow_pte) {
+            hook_err_t e3 = hook_wrap4(g_follow_pte, gup_pte_before, NULL, NULL);
+            if (e3 != HOOK_NO_ERR) {
+                CK_ERR("caoin-kpm: hook follow_page_pte fail err=%d (GUP 防护关闭)\n", e3);
+                g_follow_pte = NULL;
+            } else {
+                CK_LOG("caoin-kpm: follow_page_pte hooked @%lx (GUP 防护开)\n",
+                       (unsigned long)g_follow_pte);
+            }
+        } else {
+            CK_ERR("caoin-kpm: follow_page_pte not found (GUP 防护关闭)\n");
+        }
+    }
+    /* per-CPU 懒安装（可选增强）：装不上只 warn——缺它时跨核可见性退回
+     * 旧行为（insmod 核生效、其他核可能沿用旧翻译）。 */
+    {
+        g_cpu_key_n = 0;
+        g_cpu_armed_cnt = 0;
+        g_switch_to = (void *)(unsigned long)kallsyms_lookup_name("__switch_to");
+        if (g_switch_to) {
+            hook_err_t e4 = hook_wrap2(g_switch_to, before_switch_to,
+                                       (void *)0, (void *)0);
+            if (e4 != HOOK_NO_ERR) {
+                CK_ERR("caoin-kpm: hook __switch_to fail err=%d (懒安装关闭)\n", e4);
+                g_switch_to = NULL;
+            } else {
+                CK_LOG("caoin-kpm: __switch_to hooked @%lx (per-cpu 懒安装开)\n",
+                       (unsigned long)g_switch_to);
+            }
+        } else {
+            CK_ERR("caoin-kpm: __switch_to not found (懒安装关闭)\n");
+        }
+    }
+    /* 感知钩子组（可选，观察型）：mprotect/madvise/mmap/munmap 四类
+     * "内核改页表"入口。装不上只 warn——缺哪个回退到"该项静默失效"
+     * 的旧行为，不影响主链路。挂 syscall 入口（SyS_*）：此处尚未持
+     * mmap_sem，before 只读记录最安全。madvise 用 udata=1 区分。 */
+    if (cfg_mprot) {
+        /* 5.10+ syscall wrapper 优先（CONFIG_ARCH_HAS_SYSCALL_WRAPPER=y，
+         * 参数在 regs 里）；老内核回退 SyS_ 或 sys_ 三参入口。 */
+        g_mprot = (void *)(unsigned long)kallsyms_lookup_name("__arm64_sys_mprotect");
+        if (g_mprot) {
+            hook_err_t ew = hook_wrap1(g_mprot, wrap_before, wrap_after, (void *)1);
+            if (ew != HOOK_NO_ERR) {
+                CK_ERR("caoin-kpm: hook __arm64_sys_mprotect fail err=%d\n", ew);
+                g_mprot = NULL;
+            } else {
+                g_mprot_wrap = 1;
+                CK_LOG("caoin-kpm: mprotect hooked @%lx (wrapper, 感知开)\n",
+                       (unsigned long)g_mprot);
+            }
+        }
+        if (!g_mprot) {
+            g_mprot = (void *)(unsigned long)kallsyms_lookup_name("SyS_mprotect");
+            if (!g_mprot)
+                g_mprot = (void *)(unsigned long)kallsyms_lookup_name("sys_mprotect");
+            if (g_mprot) {
+                hook_err_t e5 = hook_wrap3(g_mprot, mprot_before,
+                                           after_mprotect, NULL);
+                if (e5 != HOOK_NO_ERR) {
+                    CK_ERR("caoin-kpm: hook mprotect fail err=%d (感知关闭)\n", e5);
+                    g_mprot = NULL;
+                } else {
+                    CK_LOG("caoin-kpm: mprotect hooked @%lx (感知开)\n",
+                           (unsigned long)g_mprot);
+                }
+            }
+        }
+        if (!g_mprot)
+            CK_ERR("caoin-kpm: no mprotect entry found (感知关闭)\n");
+        g_madv = (void *)(unsigned long)kallsyms_lookup_name("__arm64_sys_madvise");
+        if (g_madv) {
+            hook_err_t ew = hook_wrap1(g_madv, wrap_before, wrap_after, (void *)2);
+            if (ew != HOOK_NO_ERR) {
+                CK_ERR("caoin-kpm: hook __arm64_sys_madvise fail err=%d\n", ew);
+                g_madv = NULL;
+            } else {
+                g_madv_wrap = 1;
+                CK_LOG("caoin-kpm: madvise hooked @%lx (wrapper, 感知开)\n",
+                       (unsigned long)g_madv);
+            }
+        }
+        if (!g_madv) {
+            g_madv = (void *)(unsigned long)kallsyms_lookup_name("SyS_madvise");
+            if (!g_madv)
+                g_madv = (void *)(unsigned long)kallsyms_lookup_name("sys_madvise");
+        }
+        if (g_madv && !g_madv_wrap) {
+            hook_err_t e6 = hook_wrap3(g_madv, mprot_before,
+                                       after_mprotect, (void *)1);
+            if (e6 != HOOK_NO_ERR) {
+                CK_ERR("caoin-kpm: hook madvise fail err=%d (感知关闭)\n", e6);
+                g_madv = NULL;
+            } else {
+                CK_LOG("caoin-kpm: madvise hooked @%lx (感知开)\n",
+                       (unsigned long)g_madv);
+            }
+        }
+        if (!g_madv)
+            CK_ERR("caoin-kpm: no madvise entry found (感知关闭)\n");
+        g_munmap = (void *)(unsigned long)kallsyms_lookup_name("__arm64_sys_munmap");
+        if (g_munmap) {
+            hook_err_t ew = hook_wrap1(g_munmap, wrap_before, wrap_after, (void *)4);
+            if (ew != HOOK_NO_ERR) {
+                CK_ERR("caoin-kpm: hook __arm64_sys_munmap fail err=%d\n", ew);
+                g_munmap = NULL;
+            } else {
+                g_munmap_wrap = 1;
+                CK_LOG("caoin-kpm: munmap hooked @%lx (wrapper, 感知开)\n",
+                       (unsigned long)g_munmap);
+            }
+        }
+        if (!g_munmap) {
+            g_munmap = (void *)(unsigned long)kallsyms_lookup_name("SyS_munmap");
+            if (!g_munmap)
+                g_munmap = (void *)(unsigned long)kallsyms_lookup_name("sys_munmap");
+            if (g_munmap) {
+                hook_err_t e7 = hook_wrap2(g_munmap, munmap_before,
+                                           after_munmap, NULL);
+                if (e7 != HOOK_NO_ERR) {
+                    CK_ERR("caoin-kpm: hook munmap fail err=%d (感知关闭)\n", e7);
+                    g_munmap = NULL;
+                } else {
+                    CK_LOG("caoin-kpm: munmap hooked @%lx (感知开)\n",
+                           (unsigned long)g_munmap);
+                }
+            }
+        }
+        if (!g_munmap)
+            CK_ERR("caoin-kpm: no munmap entry found (感知关闭)\n");
+        g_mmap = (void *)(unsigned long)kallsyms_lookup_name("__arm64_sys_mmap");
+        if (g_mmap) {
+            hook_err_t ew = hook_wrap1(g_mmap, wrap_before, wrap_after, (void *)3);
+            if (ew != HOOK_NO_ERR) {
+                CK_ERR("caoin-kpm: hook __arm64_sys_mmap fail err=%d\n", ew);
+                g_mmap = NULL;
+            } else {
+                g_mmap_wrap = 1;
+                CK_LOG("caoin-kpm: mmap hooked @%lx (wrapper, 感知开)\n",
+                       (unsigned long)g_mmap);
+            }
+        }
+        if (!g_mmap) {
+            g_mmap = (void *)(unsigned long)kallsyms_lookup_name("SyS_mmap");
+            if (!g_mmap)
+                g_mmap = (void *)(unsigned long)kallsyms_lookup_name("sys_mmap");
+            if (g_mmap) {
+                hook_err_t e8 = hook_wrap6(g_mmap, mmap_before,
+                                           after_mmap, NULL);
+                if (e8 != HOOK_NO_ERR) {
+                    CK_ERR("caoin-kpm: hook mmap fail err=%d (感知关闭)\n", e8);
+                    g_mmap = NULL;
+                } else {
+                    CK_LOG("caoin-kpm: mmap hooked @%lx (感知开)\n",
+                           (unsigned long)g_mmap);
+                }
+            }
+        }
+        if (!g_mmap)
+            CK_ERR("caoin-kpm: no mmap entry found (感知关闭)\n");
     }
     g_hooks_installed = 1;
     vbar_on = 1;
@@ -2615,7 +4298,7 @@ static long caoin_init(const char *args, const char *event, void *__user reserve
     /* stub=1：加载即装桩（跳过 INJ_REQ 握手）。caoin_prep 自动化流程用——
      * 目标不发注入请求，工具已备好影子页（原页快照）与 status 页。
      * 桩经目标 mm 的页表 walk 写入 shadow 页，不需要目标 fault 上下文。 */
-    if (g_stub_onload) {
+    if (g_stub_onload && !g_kalloc) {
         for (i = 0; i < hooks_n; i++) {
             /* 尊重 stub_mode：原来这里无条件装 777 桩，导致 stubmode=2（recstub）
              * 在 stub=1 路径下根本测不到。 */
@@ -2714,8 +4397,167 @@ static long caoin_ctl0(const char *args, char *__user out_msg, int outlen)
                 (unsigned long long)cap_cnt, (unsigned long)kcap);
         return 0;
     }
+    /* mstat：感知快照（v3，magic=CAOIN_MP_MAGIC）。头部计数 4 类 + last +
+     * 视图 + seq/jiffies/nrec + 16 条环形记录。返回结构体字节数；
+     * kpmctl 侧按 magic 校验后 pretty print。 */
+    if (args && !strncmp(args, "mstat", 5)) {
+        /* static：大结构放栈上会让编译器为未初始化部分生成整体 memset，
+         * 而 kpimg 的 KPM 符号表没有 "memset" 符号（只有 kf_memset）→
+         * 加载报 unknown symbol: memset。.bss 静态零初始化无此问题。 */
+        static struct {
+            u64 magic;
+            u64 mprot_hits, madv_hits, munmap_hits, mmap_hits, mdeny_hits;
+            u64 which, addr, len, arg2, ret;
+            u64 hit_view[CAOIN_MAX_HOOKS];
+            u64 now_view[CAOIN_MAX_HOOKS];
+            u64 seq, jiffies_now, nrec;
+            struct caoin_mrec rec[CAOIN_MPLOG];
+        } st;
+        u64 start, n;
+        int k;
+
+        st.magic = CAOIN_MP_MAGIC;
+        st.mprot_hits = g_mprot_hits;
+        st.madv_hits = g_madv_hits;
+        st.munmap_hits = g_munmap_hits;
+        st.mmap_hits = g_mmap_hits;
+        st.mdeny_hits = g_mdeny_hits;
+        st.which = g_mp_which;
+        st.addr = g_mp_addr;
+        st.len = g_mp_len;
+        st.arg2 = g_mp_arg2;
+        st.ret = g_mp_ret;
+        for (k = 0; k < CAOIN_MAX_HOOKS; k++) {
+            st.hit_view[k] = g_mp_view[k];
+            st.now_view[k] = k < hooks_n ? hooks[k].cur_view : 0;
+        }
+        st.seq = g_mp_seq;
+        st.jiffies_now = kvar_jiffies ? (u64)*kvar_jiffies : 0;
+        n = st.seq < CAOIN_MPLOG ? st.seq : CAOIN_MPLOG;
+        st.nrec = n;
+        /* 从最旧到最新排列：seq 覆盖后环形起点 = (seq - n) % 16。
+         * 逐字段拷贝——struct 整体赋值会被 GCC 生成显式 memcpy 调用，
+         * 而 KP 重定位器不提供 libc 符号（真机 -ENOENT "unknown symbol:
+         * memcpy"，2026-10-26 实证）。 */
+        start = st.seq - n;
+        for (k = 0; k < (int)n; k++) {
+            struct caoin_mrec *src = &g_mp_log[(start + (u64)k) % CAOIN_MPLOG];
+
+            st.rec[k].ts = src->ts;
+            st.rec[k].which = src->which;
+            st.rec[k].addr = src->addr;
+            st.rec[k].len = src->len;
+            st.rec[k].arg2 = src->arg2;
+            st.rec[k].ret = src->ret;
+            st.rec[k].view = src->view;
+            st.rec[k].denied = src->denied;
+        }
+        if (!kfn_copy_to_user)
+            return -1;
+        if ((int)sizeof(st) > outlen) {
+            CK_ERR("caoin-kpm: mstat: outlen too small\n");
+            return -1;
+        }
+        if (kfn_copy_to_user(out_msg, &st, sizeof(st)))
+            return -1;
+        return (long)sizeof(st);
+    }
+    /* mclr：清感知计数/环形/限速配额（分段观察用） */
+    if (args && !strncmp(args, "mclr", 4)) {
+        int k, j;
+
+        g_mprot_hits = 0;
+        g_madv_hits = 0;
+        g_munmap_hits = 0;
+        g_mmap_hits = 0;
+        g_mdeny_hits = 0;
+        g_mp_seq = 0;
+        g_mp_which = 0;
+        g_mp_addr = g_mp_len = g_mp_arg2 = g_mp_ret = 0;
+        for (k = 0; k < CAOIN_MAX_HOOKS; k++)
+            g_mp_view[k] = 0;
+        for (k = 0; k < 4; k++)
+            g_mp_logn[k] = 0;
+        /* 用 KP 头的 memset（inline 映射到 kf_memset）整体清零：逐字段循环
+         * 会被 -O2 合并成对 "memset" 符号的调用，而 KPM 符号表只有 kf_memset，
+         * 加载时报 unknown symbol: memset。 */
+        memset(g_mp_log, 0, sizeof(g_mp_log));
+        CK_LOG("caoin-kpm: mstat cleared\n");
+        return 0;
+    }
+    /* set <key>=<val>：运行时改参（免 unload/reload）。白名单只放观察型
+     * 参数——结构性参数（pid/tvaN/shvaN/sva/e2/stub 系列/kalloc）在 load
+     * 时已固化为页表状态，运行时改必然错乱，拒绝。 */
+    if (args && !strncmp(args, "set ", 4)) {
+        const char *kv = args + 4;
+        static const char wl[][9] = {
+            "arg", "capmax=", "capmin=", "capoff=", "captext=",
+            "injmin=", "verbose=", "quiet=", "mprot=", "rearm=", "mdeny="
+        };
+        int wi, j, ok = 0;
+
+        for (wi = 0; wi < (int)(sizeof(wl) / sizeof(wl[0])); wi++) {
+            for (j = 0; wl[wi][j] && kv[j] == wl[wi][j]; j++)
+                ;
+            if (wl[wi][j] == 0) {
+                ok = 1;
+                break;
+            }
+        }
+        if (!ok) {
+            CK_ERR("caoin-kpm: set: key not in whitelist: %s\n", kv);
+            return -1;
+        }
+        parse_args(kv);
+        CK_ERR("caoin-kpm: set %s applied (runtime)\n", kv);
+        return 0;
+    }
+    /* get：dmesg 打印当前可运行时修改的配置（人读） */
+    if (args && !strcmp(args, "get")) {
+        int k;
+
+        for (k = 0; k < CAOIN_MAX_ARGS; k++)
+            if (g_has_arg[k])
+                pr_info("caoin-kpm: arg%d=%llx\n", k,
+                        (unsigned long long)g_args[k]);
+        pr_info("caoin-kpm: mprot=%llu mdeny=%llu verbose=%llu quiet=%llu "
+                "capmax=%llx capmin=%llx injmin=%llx rearm=%llu\n",
+                (unsigned long long)cfg_mprot,
+                (unsigned long long)cfg_mdeny,
+                (unsigned long long)g_verbose,
+                (unsigned long long)g_quiet,
+                (unsigned long long)cfg_capmax,
+                (unsigned long long)cfg_cap_min,
+                (unsigned long long)cfg_inj_min,
+                (unsigned long long)g_rearm_on);
+        return 0;
+    }
     if (args && !strcmp(args, "restore"))
         return caoin_restore();
+    /* unmap：卸载收尾，把 KPM/prep 在目标 mm 建的 status/注入页 munmap 掉。
+     * 必须在 restore 之后（vbar_on=0，KPM 不再使用 status 页）。 */
+    if (args && !strncmp(args, "unmap", 5)) {
+        if (vbar_on)
+            return -1;
+        if (kfn_do_munmap && kfn_down_write && kfn_up_write && mm_run) {
+            if (cfg_sva) {
+                kfn_down_write((void *)(mm_run + g_mmap_sem_off));
+                kfn_do_munmap((void *)mm_run, (unsigned long)cfg_sva, 0x1000);
+                kfn_up_write((void *)(mm_run + g_mmap_sem_off));
+                CK_ERR("caoin-kpm: unmap sva=%lx\n", (unsigned long)cfg_sva);
+                cfg_sva = 0;
+                cfg_e2 = 0;
+            }
+            if (cfg_injva) {
+                kfn_down_write((void *)(mm_run + g_mmap_sem_off));
+                kfn_do_munmap((void *)mm_run, (unsigned long)cfg_injva, 0x1000);
+                kfn_up_write((void *)(mm_run + g_mmap_sem_off));
+                CK_ERR("caoin-kpm: unmap injva=%lx\n", (unsigned long)cfg_injva);
+                cfg_injva = 0;
+            }
+        }
+        return 0;
+    }
     pr_info("caoin-kpm: armed=%llu hooks=%d mm=%lx\n",
             (unsigned long long)vbar_on, hooks_n, mm_run);
     for (i = 0; i < hooks_n; i++)
@@ -2739,7 +4581,7 @@ static long caoin_exit(void *__user reserved)
 }
 
 KPM_NAME("caoin-shadow");
-KPM_VERSION("0.6.0");
+KPM_VERSION("0.6.4");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("caoin");
 KPM_DESCRIPTION("caoin traceless hook - multi-hook dpf shadow seesaw (muted logs)");

@@ -479,6 +479,34 @@ static int hw_step_pop(void *task, int *is_w, u64 *val)
     return slot;
 }
 
+/* 该任务是否有"命中后、单步异常前"的挂起单步（可能已被抢占）。 */
+static int hw_step_has(void *task)
+{
+    int i, found = 0;
+
+    if (!task) return 0;
+    while (hw_xchg(&g_step_lock, 1))
+        asm volatile("yield" ::: "memory");
+    for (i = 0; i < HW_MAX_CPU; i++)
+        if (g_steps[i].task == task) { found = 1; break; }
+    asm volatile("stlr %w0, [%1]" :: "r"(0), "r"(&g_step_lock) : "memory");
+    return found;
+}
+
+/* 清掉属于指定 mm 的挂起单步（mm 销毁时调用；任务指针可能被复用）。 */
+static void hw_step_forget_mm(u64 mm)
+{
+    int i;
+
+    while (hw_xchg(&g_step_lock, 1))
+        asm volatile("yield" ::: "memory");
+    for (i = 0; i < HW_MAX_CPU; i++) {
+        if (g_steps[i].task && hw_task_mm_of(g_steps[i].task) == mm)
+            g_steps[i].task = (void *)0;
+    }
+    asm volatile("stlr %w0, [%1]" :: "r"(0), "r"(&g_step_lock) : "memory");
+}
+
 static void hw_prog_record(int is_w, int slot)
 {
     int id = hw_cpu_id();
@@ -601,7 +629,10 @@ static void hw_program_next(void *next_task)
     struct hw_bp *b;
     int i;
 
-    hw_step_pop((void *)current, (int *)0, (u64 *)0);
+    /* 注意：不能在这里 pop 出向任务的单步记录。命中断点后、单步异常前
+     * 目标可能被抢占；记录丢了会让目标自己收 SIGTRAP，而 MDSCR.SS 留在
+     * 本核上会让**下一个任务**收 SIGTRAP（5.10 真机实测：init 收 SIGTRAP
+     * → do_exit BUG → panic）。记录留着，等该任务再被调度回来时恢复。 */
     hw_prog_clear();
 
     bp_lock();
@@ -662,6 +693,15 @@ static void hw_program_next(void *next_task)
         }
     }
     bp_unlock();
+    /* MDSCR.SS 是 per-CPU 且内核不随任务切换：只给"有待完成单步"的
+     * incoming 任务置位，其余一律清掉（防单步异常泄漏给无关任务）。 */
+    {
+        u64 md = hw_mdscr_read() & ~HW_MDSCR_SS;
+
+        if (hw_step_has(next_task))
+            md |= HW_MDSCR_SS;
+        hw_mdscr_write(md);
+    }
 }
 
 static void *g_switch_to;
@@ -934,8 +974,12 @@ static void hw_exc_uninstall(void)
 static void *g_exit_mmap;
 static void hw_exit_mmap_before(hook_fargs1_t *fargs, void *udata)
 {
+    u64 mm = (u64)fargs->arg0;
+
     (void)udata;
-    hw_forget_mm(fargs->arg0);
+    hw_forget_mm((void *)mm);
+    /* mm 销毁：挂起单步记录里的任务指针可能被复用 → 一并清掉 */
+    hw_step_forget_mm(mm);
 }
 
 /* ---------------- add/del/clear ---------------- */
@@ -1414,7 +1458,13 @@ static long caoin_hw_ctl0(const char *args, char *__user out_msg, int outlen)
     if (!args) return -1;
     len = strlen(args);
     if (len <= 0 || len >= (int)sizeof(buf)) return -1;
-    memcpy(buf, args, len + 1);
+    /* 不用 memcpy：KPM 重定位器没有 libc 符号（4.9 实测 -ENOENT）。 */
+    {
+        int i;
+
+        for (i = 0; i <= len; i++)
+            buf[i] = args[i];
+    }
     return hw_ctl_exec(buf);
 }
 

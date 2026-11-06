@@ -11,6 +11,10 @@ install -m 755 cli/caoin build/caoin
 
 # caoin_prep：KPM 流程自动化准备（远程符号解析 + 影子页/status 页准备 → args）
 $CC -Wall -O2 -static cli/prep.c -o build/caoin_prep
+# kpmctl：KPM ctl0 supercall 客户端（dump/read/capinfo/status + poke/cow）
+# -nostdlib：本机 4.9 内核对 filesz=0 的 .bss PT_LOAD 会启动即 segfault，
+# 源码里零未初始化静态存储（dump 缓冲运行时 mmap），必须保持
+$CC -Wall -O2 -nostdlib -static -fno-pic cli/kpmctl.c -o build/kpmctl
 # shtarget：caoin_prep 测试目标（动态链接 bionic，符号进 .dynsym 供远程解析）
 $CC -Wall -O2 -nostdlib -pie tests/shtarget.c -o build/shtarget \
     -Wl,--dynamic-linker=/system/bin/linker64 \
